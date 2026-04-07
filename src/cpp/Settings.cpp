@@ -1,6 +1,6 @@
 #include "Settings.h"
 
-const char* tr(Language lang, const char* en, const char* ru) {
+std::string tr(Language lang, const std::string& en, const std::string& ru) {
     return lang == Language::RU ? ru : en;
 }
 

@@ -8,6 +8,7 @@ int readKey();
 void clearScreen();
 void hideCursor();
 void showCursor();
-void pauseScreen(Language lang, const std::string& message);
+void pauseScreen(const std::string& message);
+std::string inputString(const std::string& prompt, Language lang);
 
 #endif // VL2_CONSOLE_UTILS_H

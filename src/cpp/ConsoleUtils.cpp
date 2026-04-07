@@ -51,7 +51,10 @@ void clearScreen() {
 #ifdef _WIN32
     std::system("cls");
 #else
-    std::cout << "\033[2J\033[H";
+    if (std::system("clear") != 0) {
+        std::cout << "\033[2J\033[H";
+    }
+    std::cout.flush();
 #endif
 }
 
@@ -87,9 +90,36 @@ void showCursor() {
 #endif
 }
 
-void pauseScreen(Language lang, const std::string& message) {
+void pauseScreen(const std::string& message) {
     showCursor();
     std::cout << message;
     readKey();
     hideCursor();
+}
+
+std::string inputString(const std::string& prompt, Language lang) {
+    showCursor();
+    std::cout << prompt;
+    std::string input;
+    while (true) {
+        int key = readKey();
+        if (key == '\n' || key == '\r') {
+            std::cout << "\n";
+            break;
+        } else if (key == 3) { // Ctrl+C
+            input = ""; // cancel
+            std::cout << "\n" << tr(lang, "Cancelled.", "Отменено.") << "\n";
+            break;
+        } else if (key == 127 || key == 8) { // backspace
+            if (!input.empty()) {
+                input.pop_back();
+                std::cout << "\b \b";
+            }
+        } else if (key >= 32 && key <= 126) {
+            input += (char)key;
+            std::cout << (char)key;
+        }
+    }
+    hideCursor();
+    return input;
 }
