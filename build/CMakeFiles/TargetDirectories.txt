@@ -1,3 +1,0 @@
-/Users/lcky/project/vL2/build/CMakeFiles/vl2.dir
-/Users/lcky/project/vL2/build/CMakeFiles/edit_cache.dir
-/Users/lcky/project/vL2/build/CMakeFiles/rebuild_cache.dir
