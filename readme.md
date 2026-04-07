@@ -22,7 +22,7 @@
 ### Из исходников
 
 ```bash
-git clone https://github.com/yourusername/vl2.git
+[git clone https://github.com/lackyhy/vL2.git
 cd vl2
 make build
 ```
