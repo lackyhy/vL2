@@ -539,14 +539,33 @@ bool setupSystemVPN(const Settings& settings, ProcessId xrayPid) {
     std::cout << tr(settings.language, "System VPN enabled.", "Системный VPN включен.") << "\n";
 
 #elif defined(_WIN32)
+    std::cout << "Windows: " << tr(settings.language,
+        "Configuring system proxy via registry and WinHTTP...",
+        "Настройка системного прокси через реестр и WinHTTP...") << "\n\n";
+
+    // Format: socks=host:port;http=host:port;https=host:port
+    std::string proxyValue = "socks=" + listenAddr + ";http=" + listenAddr + ";https=" + listenAddr;
+
+    // Set IE/WinInet proxy (affects browsers, .NET, most apps)
+    std::string regPath = "\"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\"";
+    std::string enableCmd = "reg add " + regPath + " /v ProxyEnable /t REG_DWORD /d 1 /f >nul 2>&1";
+    std::string serverCmd = "reg add " + regPath + " /v ProxyServer /t REG_SZ /d \"" + proxyValue + "\" /f >nul 2>&1";
+    std::string overrideCmd = "reg add " + regPath + " /v ProxyOverride /t REG_SZ /d \"localhost;127.*;<local>\" /f >nul 2>&1";
+
+    system(enableCmd.c_str());
+    system(serverCmd.c_str());
+    system(overrideCmd.c_str());
+
+    // Set WinHTTP proxy (affects system-level HTTP clients, some apps)
+    std::string winHttpCmd = "netsh winhttp set proxy proxy-server=\"" + listenAddr + "\" bypass-list=\"localhost;127.*;::1\" >nul 2>&1";
+    system(winHttpCmd.c_str());
+
+    std::cout << tr(settings.language, "System proxy set: ", "Системный прокси установлен: ") << listenAddr << "\n";
     std::cout << tr(settings.language,
-        "Windows: System-wide VPN redirection is not supported in this version.\n"
-        "Configure your applications to use the proxy manually: ",
-        "Windows: Системное перенаправление VPN не поддерживается в этой версии.\n"
-        "Настройте приложения вручную для использования прокси: ")
-        << listenAddr << "\n";
-    pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
-    return false;
+        "Proxy type: SOCKS5/HTTP/HTTPS -> xray-core.\n"
+        "Note: Apps already running may need a restart to pick up the proxy.",
+        "Тип прокси: SOCKS5/HTTP/HTTPS -> xray-core.\n"
+        "Примечание: уже запущенные приложения могут потребовать перезапуска.") << "\n";
 #endif
 
     std::cout << tr(settings.language,
@@ -577,6 +596,15 @@ bool cleanupSystemVPN(const Settings& settings) {
     }
     system("sudo systemctl restart systemd-resolved 2>/dev/null");
     std::cout << tr(settings.language, "iptables rules cleared.", "Правила iptables очищены.") << "\n";
+#elif defined(_WIN32)
+    // Disable IE/WinInet proxy
+    std::string regPath = "\"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings\"";
+    system(("reg add " + regPath + " /v ProxyEnable /t REG_DWORD /d 0 /f >nul 2>&1").c_str());
+    system(("reg delete " + regPath + " /v ProxyServer /f >nul 2>&1").c_str());
+    system(("reg delete " + regPath + " /v ProxyOverride /f >nul 2>&1").c_str());
+    // Reset WinHTTP proxy
+    system("netsh winhttp reset proxy >nul 2>&1");
+    std::cout << tr(settings.language, "System proxy disabled.", "Системный прокси отключен.") << "\n";
 #endif
 
     std::cout << tr(settings.language, "System VPN cleaned up.", "Системный VPN очищен.") << "\n";

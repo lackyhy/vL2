@@ -8,8 +8,45 @@
 #include <filesystem>
 #include <regex>
 #include <algorithm>
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <climits>
+#elif defined(__linux__)
+#include <unistd.h>
+#include <climits>
+#endif
 
 namespace fs = std::filesystem;
+
+// Returns the directory where the vL2 executable lives.
+// Settings and profiles are stored there so they follow the binary, not cwd.
+static std::string getDataDir() {
+#ifdef _WIN32
+    char buf[MAX_PATH] = {0};
+    if (GetModuleFileNameA(NULL, buf, MAX_PATH)) {
+        return fs::path(buf).parent_path().string();
+    }
+#elif defined(__APPLE__)
+    char buf[PATH_MAX] = {0};
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) == 0) {
+        char resolved[PATH_MAX] = {0};
+        if (realpath(buf, resolved)) {
+            return fs::path(resolved).parent_path().string();
+        }
+    }
+#elif defined(__linux__)
+    char buf[PATH_MAX] = {0};
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
+        return fs::path(buf).parent_path().string();
+    }
+#endif
+    return "."; // fallback
+}
 
 static std::string encryptDecrypt(const std::string& data, const std::string& key) {
     std::string result = data;
@@ -559,15 +596,17 @@ void saveProfiles(const std::vector<Profile>& profiles) {
         data += serializeProfile(profile);
     }
     std::string encrypted = encryptDecrypt(data, "xray_launcher_key");
-    std::ofstream file("profiles.dat", std::ios::binary);
+    std::string path = getDataDir() + "/profiles.dat";
+    std::ofstream file(path, std::ios::binary);
     if (file.is_open()) {
         file.write(encrypted.c_str(), encrypted.size());
     }
 }
 
 void loadProfiles(std::vector<Profile>& profiles) {
-    if (!fs::exists("profiles.dat")) return;
-    std::ifstream file("profiles.dat", std::ios::binary);
+    std::string path = getDataDir() + "/profiles.dat";
+    if (!fs::exists(path)) return;
+    std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) return;
     std::string encrypted((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     std::string data = encryptDecrypt(encrypted, "xray_launcher_key");
@@ -582,7 +621,8 @@ void loadProfiles(std::vector<Profile>& profiles) {
 }
 
 void saveSettings(const Settings& settings) {
-    std::ofstream file("settings.dat");
+    std::string path = getDataDir() + "/settings.dat";
+    std::ofstream file(path);
     if (!file.is_open()) return;
     file << "autoStart=" << (settings.autoStart ? "1" : "0") << "\n";
     file << "useProxy=" << (settings.useProxy ? "1" : "0") << "\n";
@@ -595,8 +635,9 @@ void saveSettings(const Settings& settings) {
 }
 
 void loadSettings(Settings& settings) {
-    if (!fs::exists("settings.dat")) return;
-    std::ifstream file("settings.dat");
+    std::string path = getDataDir() + "/settings.dat";
+    if (!fs::exists(path)) return;
+    std::ifstream file(path);
     if (!file.is_open()) return;
     std::string line;
     while (std::getline(file, line)) {

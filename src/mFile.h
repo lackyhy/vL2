@@ -5,7 +5,7 @@
 
 namespace mFile {
     static constexpr const char* APP_NAME = "vL2";
-    static constexpr const char* APP_VERSION = "0.1.4";
+    static constexpr const char* APP_VERSION = "1.4.6";
     static constexpr const char* APP_BUILD = "alpha";
     static constexpr const char* APP_DEVELOPERS = "lcky";
     static constexpr const char* APP_COPYRIGHT = "2026";

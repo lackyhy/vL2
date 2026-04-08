@@ -21,3 +21,7 @@ target_compile_options(vl2 PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/W4>
     $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra;-Wpedantic>
 )
+
+if(WIN32)
+    target_link_libraries(vl2 PRIVATE shell32 user32)
+endif()

@@ -6,6 +6,7 @@
 #include "Menu.h"
 #include "XrayLauncher.h"
 #include "Settings.h"
+#include "TrayIcon.h"
 #include "mFile.h"
 
 int main() {
@@ -21,6 +22,7 @@ int main() {
     std::string activeLogFile;
 
     signal(SIGINT, SIG_IGN);
+    loadSettings(settings);
     loadProfiles(profiles);
 
     // Check if xray-core binary exists, offer to download if not
@@ -62,22 +64,34 @@ int main() {
     }
 
     hideCursor();
+    bool logsEnabled = true;   // runtime toggle via tray context menu
+
     while (true) {
+#ifndef _WIN32
+        // ── Non-Windows: simple text-based "tray" ──────────────────────────
         if (trayMode) {
             clearScreen();
             std::cout << "=== " << mFile::APP_NAME << " ===\n";
-            std::cout << tr(settings.language, "Application is minimized to tray.", "Приложение свернуто в трей.") << "\n";
-            std::cout << tr(settings.language, "Press Ctrl+F to restore.", "Нажмите Ctrl+F, чтобы развернуть.") << "\n";
-            std::cout << tr(settings.language, "Press Ctrl+T to view xray-core logs.", "Нажмите Ctrl+T для просмотра логов xray-core.") << "\n";
+            std::cout << tr(settings.language,
+                "Application is minimized. Press Ctrl+F to restore.",
+                "Приложение свёрнуто. Ctrl+F — восстановить.") << "\n";
+            if (xrayRunning) {
+                std::cout << tr(settings.language, "Port: ", "Порт: ")
+                          << settings.proxyPort << "\n";
+            }
+            std::cout << tr(settings.language,
+                "Press Ctrl+T to view xray-core logs.",
+                "Нажмите Ctrl+T для просмотра логов xray-core.") << "\n";
             int key = readKey();
             if (key == 6) {
                 trayMode = false;
-            } else if (key == 20 && xrayRunning && !activeLogFile.empty()) {
+            } else if (key == 20 && xrayRunning && !activeLogFile.empty() && logsEnabled) {
                 trayMode = false;
                 showXrayLog(activeLogFile, settings.language);
             }
             continue;
         }
+#endif
 
         xrayRunning = (activePid != 0 && isXrayRunning(activePid));
         if (!xrayRunning) {
@@ -93,7 +107,7 @@ int main() {
         }
         std::cout << "\n";
         std::cout << tr(settings.language, "Use arrow keys or type a number to choose.", "Используйте стрелки или введите цифру для выбора.") << "\n";
-        std::cout << tr(settings.language, "Press Enter to execute.", "Нажмите Enter для выполнения.") << "\n\n";
+        std::cout << tr(settings.language, "Press Enter to execute. Press Q to quit.", "Нажмите Enter для выполнения. Q — выход.") << "\n\n";
 
         std::vector<std::string> menuItems = {
             tr(settings.language, "Launch xray-core", "Запустить xray-core"),
@@ -122,12 +136,41 @@ int main() {
         if (key == 3) { // Ctrl+C
             continue; // ignore
         }
-        if (key == 6) { // Ctrl+F
+        if (key == 'q' || key == 'Q') { // q/Q — exit
+            showCursor();
+            clearScreen();
+            if (systemVpnActive) {
+                cleanupSystemVPN(settings);
+            }
+            std::cout << tr(settings.language, "Exit...", "Выход...") << "\n";
+            return 0;
+        }
+        if (key == 6) { // Ctrl+F — minimise to tray
+#ifdef _WIN32
+            TrayConfig trayCfg;
+            trayCfg.port        = settings.proxyPort;
+            trayCfg.xrayRunning = xrayRunning;
+            trayCfg.logsEnabled = logsEnabled;
+            trayCfg.language    = settings.language;
+            trayCfg.logFile     = activeLogFile;
+            TrayResult trayRes  = enterTrayMode(trayCfg);
+            logsEnabled         = trayRes.logsEnabled;
+            if (!trayRes.restore) {
+                // User chose "Exit" from tray context menu
+                showCursor();
+                clearScreen();
+                if (systemVpnActive) cleanupSystemVPN(settings);
+                std::cout << tr(settings.language, "Exit...", "Выход...") << "\n";
+                return 0;
+            }
+            // Restored — fall through to normal menu loop
+#else
             trayMode = true;
+#endif
             continue;
         }
         if (key == 20) { // Ctrl+T
-            if (xrayRunning && !activeLogFile.empty()) {
+            if (xrayRunning && !activeLogFile.empty() && logsEnabled) {
                 showXrayLog(activeLogFile, settings.language);
             }
             continue;
@@ -226,6 +269,7 @@ int main() {
             } else if (selectedItem == settingsStr) {
                 showCursor();
                 editSettings(settings);
+                saveSettings(settings);
                 hideCursor();
             } else if (selectedItem == statusStr) {
                 clearScreen();
