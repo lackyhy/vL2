@@ -31,6 +31,21 @@ if(WIN32)
     target_link_libraries(vl2 PRIVATE shell32 user32)
 endif()
 
+# ── MinGW: statically link the C++ / GCC runtime into the exe ──────────────
+# Without this, the exe requires libstdc++-6.dll, libgcc_s_seh-1.dll and
+# libwinpthread-1.dll to be present on the target machine. Static linking
+# embeds them directly — no DLL dependency, no "entry point not found" errors.
+if(MINGW)
+    target_link_options(vl2 PRIVATE
+        -static-libgcc
+        -static-libstdc++
+        # Statically pull in winpthread (pthreads used by std::thread / filesystem)
+        -Wl,-Bstatic,--whole-archive
+        -lwinpthread
+        -Wl,-Bdynamic,--no-whole-archive
+    )
+endif()
+
 # ── Xray binary embedding via .incbin ──────────────────────────────────────
 # Supported compilers: GCC, Clang, AppleClang (i.e. NOT MSVC).
 # Place the platform-appropriate xray binary in one of these locations
