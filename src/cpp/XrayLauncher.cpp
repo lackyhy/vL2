@@ -1,5 +1,6 @@
 #include "XrayLauncher.h"
 #include "ConsoleUtils.h"
+#include "xray_embedded.h"
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -12,7 +13,11 @@
 #if defined(__unix__) || defined(__APPLE__)
 #include <signal.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
+#endif
+#ifdef _WIN32
+#include <windows.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -179,6 +184,49 @@ static bool isExecutableFile(const fs::path& path) {
     return fs::exists(path) && fs::is_regular_file(path);
 }
 
+std::string extractEmbeddedXray() {
+#ifndef VL2_EMBED_XRAY
+    return {};
+#else
+    if (g_xray_size == 0) return {};
+
+    // ── Choose extraction directory ────────────────────────────────────────
+#ifdef _WIN32
+    char tmpBuf[MAX_PATH] = {};
+    GetTempPathA(MAX_PATH, tmpBuf);
+    std::string extractDir = std::string(tmpBuf) + "vl2_xray";
+    std::string extractPath = extractDir + "\\xray.exe";
+    CreateDirectoryA(extractDir.c_str(), nullptr);
+#else
+    const char* tmpBase = std::getenv("TMPDIR");
+    std::string extractDir = std::string(tmpBase ? tmpBase : "/tmp") + "/vl2_xray";
+    std::string extractPath = extractDir + "/xray";
+    mkdir(extractDir.c_str(), 0755);
+#endif
+
+    // ── Skip extraction if already up-to-date ─────────────────────────────
+    std::error_code ec;
+    auto existingSize = fs::file_size(extractPath, ec);
+    if (!ec && existingSize == static_cast<uintmax_t>(g_xray_size)) {
+        return extractPath;  // already extracted, same size
+    }
+
+    // ── Write embedded bytes to disk ──────────────────────────────────────
+    {
+        std::ofstream out(extractPath, std::ios::binary | std::ios::trunc);
+        if (!out) return {};
+        out.write(reinterpret_cast<const char*>(g_xray_data),
+                  static_cast<std::streamsize>(g_xray_size));
+    }
+
+#if defined(__unix__) || defined(__APPLE__)
+    chmod(extractPath.c_str(), 0755);
+#endif
+
+    return extractPath;
+#endif // VL2_EMBED_XRAY
+}
+
 static bool isXrayProcessRunning(ProcessId pid) {
 #ifdef _WIN32
     return pid != 0;
@@ -201,6 +249,13 @@ static std::vector<fs::path> buildSearchPaths(const Settings& settings) {
 }
 
 std::string findXrayCoreBinary(const Settings& settings) {
+    // ── 1. Try embedded binary first ──────────────────────────────────────
+    std::string embedded = extractEmbeddedXray();
+    if (!embedded.empty() && fs::exists(embedded)) {
+        return embedded;
+    }
+
+    // ── 2. Fall back to filesystem search ─────────────────────────────────
     std::vector<std::string> candidates = {"xray-core", "xray", "xray-core.exe", "xray.exe"};
     for (const auto& path : buildSearchPaths(settings)) {
         if (fs::is_directory(path)) {
