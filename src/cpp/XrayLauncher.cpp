@@ -362,17 +362,31 @@ static void appendOutbound(std::ostringstream& oss, const Profile& profile) {
     }
 }
 
-// ── TUN-mode config (xray v5 tun inbound) ─────────────────────────────────
-// Xray creates the virtual network interface itself when this config is used.
-// Requires root/administrator on most platforms.
+// ── TUN-mode config (xray tun inbound) ────────────────────────────────────
+// xray creates the virtual network interface itself.
+// NOTE: xray tun does NOT support autoRoute/strictRoute (those are sing-box
+// fields). Routing must be set up by the host OS after xray starts —
+// see setupTunRoutes() below.
 std::string generateTunConfig(const Profile& profile, const Settings& settings) {
     std::ostringstream oss;
 
-    std::string tunAddr  = settings.tunnelSubnet.empty() ? "10.8.0.1/30" : settings.tunnelSubnet;
-    std::string tunName  = (settings.tunInterface.empty() || settings.tunInterface == "auto")
-                           ? "" : settings.tunInterface;
+    std::string tunAddr = settings.tunnelSubnet.empty() ? "10.8.0.1/30" : settings.tunnelSubnet;
+    std::string tunName = (settings.tunInterface.empty() || settings.tunInterface == "auto")
+                          ? "" : settings.tunInterface;
 
-    // Build DNS list from settings
+    // Log level string
+    auto logLevelStr = [&]() -> std::string {
+        switch (settings.logLevel) {
+            case 1: return "debug";
+            case 2: return "info";
+            case 3: return "warning";
+            case 4: return "error";
+            case 5: return "none";
+            default: return "warning";
+        }
+    }();
+
+    // DNS servers JSON array
     std::string dnsBlock;
     {
         std::istringstream dss(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
@@ -387,34 +401,31 @@ std::string generateTunConfig(const Profile& profile, const Settings& settings) 
     }
 
     oss << "{\n"
-        << "  \"log\": { \"loglevel\": \"" << [&]() -> std::string {
-               switch (settings.logLevel) {
-                   case 1: return "debug";
-                   case 2: return "info";
-                   case 3: return "warning";
-                   case 4: return "error";
-                   case 5: return "none";
-                   default: return "warning";
-               }
-           }() << "\" },\n"
-        << "  \"dns\": { \"servers\": [" << dnsBlock << "] },\n"
+        << "  \"log\": { \"loglevel\": \"" << logLevelStr << "\" },\n"
+        << "  \"dns\": {\n"
+        << "    \"servers\": [" << dnsBlock << "],\n"
+        << "    \"queryStrategy\": \"" << (settings.enableIPv6 ? "UseIP" : "UseIPv4") << "\"\n"
+        << "  },\n"
         << "  \"inbounds\": [\n"
         << "    {\n"
         << "      \"tag\": \"tun-in\",\n"
         << "      \"protocol\": \"tun\",\n"
         << "      \"settings\": {\n"
-        << "        \"address\": \"" << tunAddr << "\",\n";
-    if (!tunName.empty()) {
-        oss << "        \"name\": \"" << tunName << "\",\n";
+        // address must be an array in xray tun inbound
+        << "        \"address\": [\"" << tunAddr << "\"";
+    if (settings.enableIPv6) {
+        oss << ", \"fd6e:a81b:704f::1/126\"";
     }
-    oss << "        \"mtu\": 1450,\n"
-        << "        \"autoRoute\": true,\n"
-        << "        \"strictRoute\": " << (settings.killSwitch ? "true" : "false") << ",\n"
-        << "        \"endpointIndependentNat\": true\n"
-        << "      },\n"
+    oss << "],\n"
+        << "        \"mtu\": 1450\n";
+    if (!tunName.empty()) {
+        // Note: "name" is supported in newer xray builds; ignored if not supported
+        oss << "        ,\"name\": \"" << tunName << "\"\n";
+    }
+    oss << "      },\n"
         << "      \"sniffing\": {\n"
         << "        \"enabled\": true,\n"
-        << "        \"destOverride\": [\"http\", \"tls\", \"quic\"]\n"
+        << "        \"destOverride\": [\"http\", \"tls\"]\n"
         << "      }\n"
         << "    }";
 
@@ -740,6 +751,271 @@ bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunne
 // Generates a TUN inbound config (xray v5+), writes it, and launches xray
 // with root/sudo so it can create the virtual network interface.
 // outIfaceName is populated with the interface name (e.g. "tun0", "utun5").
+// ── Extract server host from profile address (host:port) ──────────────────
+static std::string profileServerHost(const Profile& profile) {
+    size_t colon = profile.address.rfind(':');
+    if (colon != std::string::npos) return profile.address.substr(0, colon);
+    return profile.address;
+}
+
+// ── Resolve hostname to IP (needed for route add which requires IP) ────────
+static std::string resolveHostname(const std::string& host) {
+    // If already an IP, return as-is
+    bool isIp = true;
+    for (char c : host) {
+        if (!isdigit(c) && c != '.') { isIp = false; break; }
+    }
+    if (isIp && host.find('.') != std::string::npos) return host;
+
+    // Try dig first, then host, then nslookup
+    std::string cmd = "dig +short " + host + " A 2>/dev/null | grep -E '^[0-9]+\\.' | head -1";
+    FILE* p = popen(cmd.c_str(), "r");
+    char buf[64] = {0};
+    if (p) {
+        fgets(buf, sizeof(buf), p);
+        pclose(p);
+        buf[strcspn(buf, "\n ")] = '\0';
+        if (buf[0]) return buf;
+    }
+
+    // Fallback: getent hosts (Linux) / host command (macOS)
+    memset(buf, 0, sizeof(buf));
+    cmd = "host " + host + " 2>/dev/null | awk '/has address/{print $NF; exit}'";
+    p = popen(cmd.c_str(), "r");
+    if (p) {
+        fgets(buf, sizeof(buf), p);
+        pclose(p);
+        buf[strcspn(buf, "\n ")] = '\0';
+        if (buf[0]) return buf;
+    }
+
+    return {};  // resolution failed
+}
+
+// ── Check if we have internet connectivity through the tunnel ──────────────
+static bool testConnectivity() {
+    // Try to reach 8.8.8.8 (Google DNS) with a short timeout
+#ifdef __APPLE__
+    return system("ping -c 1 -t 3 8.8.8.8 >/dev/null 2>&1") == 0;
+#else
+    return system("ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1") == 0;
+#endif
+}
+
+// ── Set up OS routing rules so traffic goes through the TUN interface ──────
+// Returns true if routes applied AND connectivity confirmed.
+// On failure, rolls back routes automatically.
+static bool setupTunRoutes(const std::string& ifaceName,
+                           const std::string& vpnServerHost,
+                           const Settings& settings) {
+#if defined(__APPLE__) || defined(__linux__)
+    // ── 1. Resolve VPN server hostname to IP ─────────────────────────────
+    std::string vpnIp;
+    if (!vpnServerHost.empty() && vpnServerHost != "invalid") {
+        std::cout << "  Resolving " << vpnServerHost << "... ";
+        std::cout.flush();
+        vpnIp = resolveHostname(vpnServerHost);
+        std::cout << (vpnIp.empty() ? "failed" : vpnIp) << "\n";
+    }
+#endif
+
+#ifdef __APPLE__
+    // ── 2. Read current default gateway & real interface ──────────────────
+    char gwBuf[64] = {0};
+    char ifBuf[32] = {0};
+    {
+        FILE* p = popen("route -n get default 2>/dev/null | awk '/gateway/{print $2}'", "r");
+        if (p) { fgets(gwBuf, sizeof(gwBuf), p); pclose(p); }
+        gwBuf[strcspn(gwBuf, "\n ")] = '\0';
+    }
+    {
+        FILE* p = popen("route -n get default 2>/dev/null | awk '/interface/{print $2}'", "r");
+        if (p) { fgets(ifBuf, sizeof(ifBuf), p); pclose(p); }
+        ifBuf[strcspn(ifBuf, "\n ")] = '\0';
+    }
+
+    if (!gwBuf[0]) {
+        std::cout << "  ERROR: cannot detect default gateway — aborting route setup\n";
+        return false;
+    }
+    std::cout << "  gateway=" << gwBuf << "  dev=" << ifBuf << "\n";
+
+    // Persist state for cleanup
+    { std::ofstream f("/tmp/vl2_tun_gw");     f << gwBuf; }
+    { std::ofstream f("/tmp/vl2_tun_if");     f << ifBuf; }
+    { std::ofstream f("/tmp/vl2_tun_server"); f << vpnIp;  }
+
+    // ── 3. Bypass route: VPN server → real interface (MUST be IP) ─────────
+    if (!vpnIp.empty()) {
+        std::string cmd = "sudo route add " + vpnIp + " " + std::string(gwBuf) + " 2>/dev/null";
+        system(cmd.c_str());
+    } else {
+        std::cout << "  WARNING: VPN server IP unknown — traffic may loop!\n";
+    }
+
+    // ── 4. Redirect all other traffic through TUN (two /1 cover all of /0) ─
+    system(("sudo route add 0.0.0.0/1   -interface " + ifaceName + " 2>/dev/null").c_str());
+    system(("sudo route add 128.0.0.0/1 -interface " + ifaceName + " 2>/dev/null").c_str());
+    if (settings.enableIPv6) {
+        system(("sudo route add -inet6 ::/1     -interface " + ifaceName + " 2>/dev/null").c_str());
+        system(("sudo route add -inet6 8000::/1 -interface " + ifaceName + " 2>/dev/null").c_str());
+    }
+
+    // ── 5. Set DNS ─────────────────────────────────────────────────────────
+    {
+        std::string dnsArgs;
+        std::istringstream d(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
+        std::string s;
+        while (std::getline(d, s, ',')) {
+            if (!s.empty()) dnsArgs += " " + s;
+        }
+        FILE* svcp = popen("networksetup -listallnetworkservices 2>/dev/null | tail -n +2", "r");
+        if (svcp) {
+            char svcBuf[128] = {0};
+            while (fgets(svcBuf, sizeof(svcBuf), svcp)) {
+                svcBuf[strcspn(svcBuf, "\n")] = '\0';
+                if (svcBuf[0] == '*' || svcBuf[0] == '\0') continue;
+                system(("sudo networksetup -setdnsservers '" + std::string(svcBuf) + "'" + dnsArgs + " 2>/dev/null").c_str());
+            }
+            pclose(svcp);
+        }
+    }
+
+    // ── 6. Connectivity test — rollback if broken ──────────────────────────
+    std::cout << "  Testing connectivity... ";
+    std::cout.flush();
+    usleep(1500000);  // give routes 1.5s to settle
+    if (!testConnectivity()) {
+        std::cout << "FAIL — rolling back routes!\n";
+        // Rollback
+        system(("sudo route delete 0.0.0.0/1   -interface " + ifaceName + " 2>/dev/null").c_str());
+        system(("sudo route delete 128.0.0.0/1 -interface " + ifaceName + " 2>/dev/null").c_str());
+        if (!vpnIp.empty())
+            system(("sudo route delete " + vpnIp + " 2>/dev/null").c_str());
+        // Restore DNS
+        FILE* svcp = popen("networksetup -listallnetworkservices 2>/dev/null | tail -n +2", "r");
+        if (svcp) {
+            char svcBuf[128] = {0};
+            while (fgets(svcBuf, sizeof(svcBuf), svcp)) {
+                svcBuf[strcspn(svcBuf, "\n")] = '\0';
+                if (svcBuf[0] == '*' || svcBuf[0] == '\0') continue;
+                system(("sudo networksetup -setdnsservers '" + std::string(svcBuf) + "' Empty 2>/dev/null").c_str());
+            }
+            pclose(svcp);
+        }
+        system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server");
+        return false;
+    }
+    std::cout << "OK\n";
+    return true;
+
+#elif defined(__linux__)
+    char gwBuf[64] = {0};
+    char ifBuf[32] = {0};
+    {
+        FILE* p = popen("ip route show default 2>/dev/null | awk 'NR==1{print $3}'", "r");
+        if (p) { fgets(gwBuf, sizeof(gwBuf), p); pclose(p); }
+        gwBuf[strcspn(gwBuf, "\n ")] = '\0';
+    }
+    {
+        FILE* p = popen("ip route show default 2>/dev/null | awk 'NR==1{print $5}'", "r");
+        if (p) { fgets(ifBuf, sizeof(ifBuf), p); pclose(p); }
+        ifBuf[strcspn(ifBuf, "\n ")] = '\0';
+    }
+
+    if (!gwBuf[0]) {
+        std::cout << "  ERROR: cannot detect default gateway — aborting\n";
+        return false;
+    }
+    std::cout << "  gateway=" << gwBuf << "  dev=" << ifBuf << "\n";
+
+    { std::ofstream f("/tmp/vl2_tun_gw");     f << gwBuf; }
+    { std::ofstream f("/tmp/vl2_tun_if");     f << ifBuf; }
+    { std::ofstream f("/tmp/vl2_tun_server"); f << vpnIp;  }
+
+    if (!vpnIp.empty()) {
+        system(("sudo ip route add " + vpnIp + " via " + std::string(gwBuf)
+                + " dev " + std::string(ifBuf) + " 2>/dev/null").c_str());
+    }
+
+    system(("sudo ip route add 0.0.0.0/1   dev " + ifaceName + " 2>/dev/null").c_str());
+    system(("sudo ip route add 128.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
+
+    system("sudo cp /etc/resolv.conf /tmp/vl2_resolv_backup 2>/dev/null");
+    {
+        std::ofstream rc("/tmp/vl2_resolv_new");
+        std::istringstream d(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
+        std::string s;
+        while (std::getline(d, s, ',')) {
+            if (!s.empty()) rc << "nameserver " << s << "\n";
+        }
+    }
+    system("sudo cp /tmp/vl2_resolv_new /etc/resolv.conf 2>/dev/null");
+
+    std::cout << "  Testing connectivity... ";
+    std::cout.flush();
+    usleep(1500000);
+    if (!testConnectivity()) {
+        std::cout << "FAIL — rolling back routes!\n";
+        system(("sudo ip route del 0.0.0.0/1   dev " + ifaceName + " 2>/dev/null").c_str());
+        system(("sudo ip route del 128.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
+        if (!vpnIp.empty())
+            system(("sudo ip route del " + vpnIp + " 2>/dev/null").c_str());
+        system("sudo cp /tmp/vl2_resolv_backup /etc/resolv.conf 2>/dev/null");
+        system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server");
+        return false;
+    }
+    std::cout << "OK\n";
+    return true;
+#else
+    (void)ifaceName; (void)vpnServerHost; (void)settings;
+    return false;
+#endif
+}
+
+// ── Restore routes and DNS set by setupTunRoutes() ─────────────────────────
+static void cleanupTunRoutes(const std::string& ifaceName) {
+#ifdef __APPLE__
+    // Restore VPN server specific route
+    std::string vpnServer;
+    { std::ifstream f("/tmp/vl2_tun_server"); f >> vpnServer; }
+    if (!vpnServer.empty()) {
+        system(("sudo route delete " + vpnServer + " 2>/dev/null").c_str());
+    }
+
+    // Remove the two /1 routes
+    system(("sudo route delete 0.0.0.0/1   -interface " + ifaceName + " 2>/dev/null").c_str());
+    system(("sudo route delete 128.0.0.0/1 -interface " + ifaceName + " 2>/dev/null").c_str());
+    system("sudo route delete -inet6 ::/1     2>/dev/null");
+    system("sudo route delete -inet6 8000::/1 2>/dev/null");
+
+    // Restore DNS — set all services back to "Empty" (DHCP-assigned)
+    FILE* svcp = popen("networksetup -listallnetworkservices 2>/dev/null | tail -n +2", "r");
+    if (svcp) {
+        char svcBuf[128] = {0};
+        while (fgets(svcBuf, sizeof(svcBuf), svcp)) {
+            svcBuf[strcspn(svcBuf, "\n")] = '\0';
+            if (svcBuf[0] == '*') continue;
+            system(("sudo networksetup -setdnsservers '" + std::string(svcBuf) + "' Empty 2>/dev/null").c_str());
+        }
+        pclose(svcp);
+    }
+    system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server /tmp/vl2_tun_dns_backup");
+
+#elif defined(__linux__)
+    std::string vpnServer;
+    { std::ifstream f("/tmp/vl2_tun_server"); f >> vpnServer; }
+
+    system(("sudo ip route del 0.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
+    system(("sudo ip route del 128.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
+    if (!vpnServer.empty()) {
+        system(("sudo ip route del " + vpnServer + " 2>/dev/null").c_str());
+    }
+    system("sudo cp /tmp/vl2_resolv_backup /etc/resolv.conf 2>/dev/null");
+    system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server /tmp/vl2_resolv_backup /tmp/vl2_resolv_new");
+#endif
+}
+
 bool launchXrayTun(const Settings& settings, const Profile& profile,
                    std::string& outLogFile, std::string& outIfaceName, ProcessId& outPid) {
     clearScreen();
@@ -827,13 +1103,36 @@ bool launchXrayTun(const Settings& settings, const Profile& profile,
 
     std::cout << tr(lang, "TUN interface: ", "TUN интерфейс: ") << outIfaceName << "\n";
     std::cout << tr(lang, "Tunnel subnet: ", "Подсеть туннеля: ") << settings.tunnelSubnet << "\n";
+
+    // ── Set up OS routing rules ────────────────────────────────────────────
+    std::cout << tr(lang,
+        "Setting up routing rules (hostname will be resolved to IP)...",
+        "Настройка маршрутов (хостнейм будет разрешён в IP)...") << "\n";
+    std::string vpnServer = profileServerHost(profile);
+    bool routesOk = setupTunRoutes(outIfaceName, vpnServer, settings);
+    if (!routesOk) {
+        std::cout << "\n" << tr(lang,
+            "Route setup failed or connectivity test failed — routes rolled back.\n"
+            "xray is still running as SOCKS5 proxy on 127.0.0.1:",
+            "Маршруты не применены или тест связи провалился — откат выполнен.\n"
+            "xray продолжает работать как SOCKS5 прокси на 127.0.0.1:")
+            << settings.proxyPort << "\n";
+        std::cout << tr(lang,
+            "Check xray-tun.log for errors.",
+            "Проверьте xray-tun.log для диагностики.") << "\n";
+        // Show last lines of log
+        system(("tail -20 " + outLogFile).c_str());
+    } else {
+        std::cout << tr(lang, "Routes configured. Tunnel is active.", "Маршруты настроены. Туннель активен.") << "\n";
+    }
+
     if (settings.proxyPort > 0) {
-        std::cout << tr(lang, "SOCKS5 also available on: ", "SOCKS5 также доступен на: ")
+        std::cout << tr(lang, "SOCKS5 also on: ", "SOCKS5 также на: ")
                   << "127.0.0.1:" << settings.proxyPort << "\n";
     }
     if (settings.killSwitch) {
         std::cout << tr(lang,
-            "[kill-switch ON] Traffic is blocked if tunnel drops.",
+            "[kill-switch ON] Traffic blocked if tunnel drops.",
             "[kill-switch ВКЛ] Трафик блокируется при обрыве туннеля.") << "\n";
     }
 
@@ -879,29 +1178,33 @@ bool launchXrayTun(const Settings& settings, const Profile& profile,
 // ── Cleanup for TUN mode ───────────────────────────────────────────────────
 bool cleanupTunVPN(const Settings& settings) {
     Language lang = settings.language;
-    std::cout << tr(lang, "Removing TUN interface and routing rules...",
-                         "Удаление TUN интерфейса и правил маршрутизации...") << "\n";
+    std::cout << tr(lang, "Removing TUN routing rules...",
+                         "Удаление правил маршрутизации TUN...") << "\n";
+#if defined(__APPLE__) || defined(__linux__)
+    // Read back interface name from what was detected at launch time.
+    // We pass "tun?" as fallback — cleanupTunRoutes will still try.
+    std::string ifaceName;
+    {
+        // Try to detect current utun/tun interface
 #ifdef __APPLE__
-    // utun interfaces are automatically removed when xray process exits.
-    // Flush any pf rules we may have set.
-    system("sudo pfctl -F rules 2>/dev/null");
-    system("sudo pfctl -F nat  2>/dev/null");
-    system("sudo pfctl -d      2>/dev/null");
-    std::cout << tr(lang, "macOS: utun interface released.", "macOS: utun интерфейс освобождён.") << "\n";
-#elif defined(__linux__)
-    // On Linux, the tun0 interface is held by the xray process.
-    // After xray is killed, we clean up any leftover routes.
-    system("sudo ip route del default dev tun0 2>/dev/null");
-    system("sudo ip link delete tun0 2>/dev/null");
-    // Restore previous iptables state if we saved it
-    if (std::ifstream("/tmp/vl2_iptables_backup")) {
-        system("sudo iptables-restore < /tmp/vl2_iptables_backup 2>/dev/null");
-        system("rm -f /tmp/vl2_iptables_backup");
+        FILE* p = popen("ifconfig 2>/dev/null | grep -E '^utun[0-9]+:' | tail -1 | cut -d: -f1", "r");
+#else
+        FILE* p = popen("ip link 2>/dev/null | grep -oE 'tun[0-9]+' | tail -1", "r");
+#endif
+        if (p) {
+            char buf[32] = {0};
+            if (fgets(buf, sizeof(buf), p)) {
+                buf[strcspn(buf, "\n ")] = '\0';
+                ifaceName = buf;
+            }
+            pclose(p);
+        }
     }
-    std::cout << tr(lang, "Linux: TUN interface released.", "Linux: TUN интерфейс освобождён.") << "\n";
+    if (ifaceName.empty()) ifaceName = "tun0";
+    cleanupTunRoutes(ifaceName);
+    std::cout << tr(lang, "Routes restored.", "Маршруты восстановлены.") << "\n";
 #elif defined(_WIN32)
-    // WinTUN interface is released when xray.exe exits.
-    std::cout << tr(lang, "Windows: WinTUN interface released.", "Windows: WinTUN интерфейс освобождён.") << "\n";
+    std::cout << tr(lang, "Windows: WinTUN interface will be released when xray exits.", "Windows: WinTUN интерфейс будет освобождён при выходе xray.") << "\n";
 #endif
     return true;
 }
