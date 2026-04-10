@@ -90,6 +90,26 @@ static Profile deserializeProfile(const std::string& line) {
     return p;
 }
 
+static std::string urlDecode(const std::string& src) {
+    std::string result;
+    for (size_t i = 0; i < src.size(); ++i) {
+        if (src[i] == '%' && i + 2 < src.size()) {
+            unsigned int val = 0;
+            std::istringstream hex(src.substr(i + 1, 2));
+            if (hex >> std::hex >> val) {
+                result += static_cast<char>(val);
+                i += 2;
+                continue;
+            }
+        } else if (src[i] == '+') {
+            result += ' ';
+            continue;
+        }
+        result += src[i];
+    }
+    return result;
+}
+
 static std::string base64Decode(const std::string& encoded) {
     // Simple base64 decode for demonstration
     // In real implementation, use proper base64 library
@@ -130,9 +150,9 @@ static Profile parseVlessLink(const std::string& link) {
         while (std::getline(iss, param, '&')) {
             size_t eqPos = param.find('=');
             if (eqPos != std::string::npos) {
-                std::string key = param.substr(0, eqPos);
-                std::string value = param.substr(eqPos + 1);
-                
+                std::string key   = param.substr(0, eqPos);
+                std::string value = urlDecode(param.substr(eqPos + 1));
+
                 if (key == "encryption") {
                     p.encryption = value.empty() ? "none" : value;
                 } else if (key == "flow") {
