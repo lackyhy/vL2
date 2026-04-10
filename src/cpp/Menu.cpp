@@ -299,17 +299,43 @@ static void showSettingsScreen(const Settings& settings) {
     clearScreen();
     Language lang = settings.language;
     std::cout << "=== " << tr(lang, "Settings", "Настройки") << " ===\n\n";
-    std::cout << "1. " << tr(lang, "Auto-start xray-core", "Автостарт xray-core") << ": "
+
+    // ── General ──────────────────────────────────────────────────────────────
+    std::cout << tr(lang, "--- General ---", "--- Основные ---") << "\n";
+    std::cout << " 1. " << tr(lang, "Auto-start xray-core", "Автостарт xray-core") << ": "
               << (settings.autoStart ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
-    std::cout << "2. " << tr(lang, "Use proxy", "Использовать прокси") << ": "
-              << (settings.useProxy ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
-    std::cout << "3. " << tr(lang, "Log level", "Уровень логирования") << ": " << settings.logLevel << "\n";
-    std::cout << "4. " << tr(lang, "Language", "Язык") << ": " << languageName(settings.language) << "\n";
-    std::cout << "5. " << tr(lang, "xray-core folder", "Папка xray-core") << ": " << settings.xrayCoreDir << "\n";
-    std::cout << "6. " << tr(lang, "Proxy port", "Порт прокси") << ": " << settings.proxyPort << "\n";
-    std::cout << "7. " << tr(lang, "DNS servers", "DNS серверы") << ": " << settings.dnsServers << "\n\n";
-    std::cout << tr(lang, "Type a number to change the option, or press 0 to return.",
-                         "Введите цифру для изменения опции или 0 для возвращения.") << "\n";
+    std::cout << " 2. " << tr(lang, "Language", "Язык") << ": " << languageName(settings.language) << "\n";
+    std::cout << " 3. " << tr(lang, "Log level (1-debug … 5-off)", "Уровень лога (1-debug … 5-off)") << ": ";
+    switch (settings.logLevel) {
+        case 1: std::cout << "1 (debug)";   break;
+        case 2: std::cout << "2 (info)";    break;
+        case 3: std::cout << "3 (warning)"; break;
+        case 4: std::cout << "4 (error)";   break;
+        case 5: std::cout << "5 (none)";    break;
+        default: std::cout << settings.logLevel; break;
+    }
+    std::cout << "\n";
+    std::cout << " 4. " << tr(lang, "xray-core folder", "Папка xray-core") << ": " << settings.xrayCoreDir << "\n";
+
+    // ── Proxy ─────────────────────────────────────────────────────────────────
+    std::cout << "\n" << tr(lang, "--- Proxy ---", "--- Прокси ---") << "\n";
+    std::cout << " 5. " << tr(lang, "SOCKS5 proxy port", "Порт SOCKS5 прокси") << ": " << settings.proxyPort << "\n";
+    std::cout << " 6. " << tr(lang, "HTTP proxy port (0 = disabled)", "Порт HTTP прокси (0 = откл)") << ": " << settings.httpProxyPort << "\n";
+    std::cout << " 7. " << tr(lang, "DNS servers", "DNS серверы") << ": " << settings.dnsServers << "\n";
+
+    // ── Tunnel / TUN ──────────────────────────────────────────────────────────
+    std::cout << "\n" << tr(lang, "--- TUN Tunnel ---", "--- TUN туннель ---") << "\n";
+    std::cout << " 8. " << tr(lang, "Tunnel subnet (TUN interface CIDR)", "Подсеть туннеля (CIDR TUN-интерфейса)") << ": " << settings.tunnelSubnet << "\n";
+    std::cout << " 9. " << tr(lang, "TUN interface name (auto = OS chooses)", "Имя TUN интерфейса (auto = выбирает ОС)") << ": " << settings.tunInterface << "\n";
+    std::cout << "10. " << tr(lang, "Kill-switch (block traffic if VPN drops)", "Kill-switch (блок трафика при обрыве VPN)") << ": "
+              << (settings.killSwitch ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
+    std::cout << "11. " << tr(lang, "Route IPv6 through tunnel", "Маршрутизация IPv6 через туннель") << ": "
+              << (settings.enableIPv6 ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
+    std::cout << "12. " << tr(lang, "Split-tunnel (bypass local/CN traffic)", "Split-tunnel (обход локального/CN трафика)") << ": "
+              << (settings.splitTunnel ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
+
+    std::cout << "\n" << tr(lang, "Type a number to change the option, or press 0 to return.",
+                                 "Введите цифру для изменения опции или 0 для возвращения.") << "\n";
 }
 
 static void printProfileEditMenu(const Profile& profile, Language lang) {
@@ -530,62 +556,115 @@ void editProfiles(std::vector<Profile>& profiles, Language lang) {
 }
 
 void editSettings(Settings& settings) {
+    auto readOption = [&]() -> int {
+        // Reads a 1- or 2-digit option number, similar to editProfile.
+        std::string buf;
+        while (true) {
+            int k = readKey();
+            if (k == 3) return -1;   // Ctrl+C → ignore
+            if (k == '0' && buf.empty()) return 0;
+            if (k >= '0' && k <= '9') {
+                buf += (char)k;
+                if (buf.size() == 1 && buf[0] == '1') {
+                    // Could be '1' alone or start of '10'-'12'
+                    int next = readKey();
+                    if (next >= '0' && next <= '2') {
+                        buf += (char)next;
+                    } else if (next == '\n' || next == '\r') {
+                        // '1' confirmed
+                    }
+                    // else: ignore extra key, use '1'
+                }
+                try { return std::stoi(buf); } catch (...) { return -1; }
+            }
+            if (k == '\n' || k == '\r') return -1;
+        }
+    };
+
+    Language& lang = settings.language;
+
     while (true) {
         showSettingsScreen(settings);
-        int key = readKey();
-        if (key == 3) continue; // ignore Ctrl+C
-        if (key == '0') {
-            break;
-        }
-        if (key == '1') {
+        int option = readOption();
+        if (option == -1) continue;
+        if (option == 0) break;
+
+        clearScreen();
+        if (option == 1) {
             settings.autoStart = !settings.autoStart;
-        } else if (key == '2') {
-            settings.useProxy = !settings.useProxy;
-        } else if (key == '3') {
+        } else if (option == 2) {
+            settings.language = (lang == Language::EN ? Language::RU : Language::EN);
+        } else if (option == 3) {
             settings.logLevel = (settings.logLevel % 5) + 1;
-        } else if (key == '4') {
-            settings.language = (settings.language == Language::EN ? Language::RU : Language::EN);
-        } else if (key == '5') {
-            clearScreen();
+        } else if (option == 4) {
             std::string path = inputString(
-                tr(settings.language,
+                tr(lang,
                    "Enter xray-core folder path (current: " + settings.xrayCoreDir + "): ",
                    "Введите путь к папке xray-core (текущий: " + settings.xrayCoreDir + "): "),
-                settings.language);
-            if (!path.empty()) {
-                settings.xrayCoreDir = path;
-            }
-        } else if (key == '6') {
-            clearScreen();
+                lang);
+            if (!path.empty()) settings.xrayCoreDir = path;
+        } else if (option == 5) {
             std::string portStr = inputString(
-                tr(settings.language,
-                   "Enter proxy port (current: " + std::to_string(settings.proxyPort) + ", range 1-65535): ",
-                   "Введите порт прокси (текущий: " + std::to_string(settings.proxyPort) + ", диапазон 1-65535): "),
-                settings.language);
+                tr(lang,
+                   "SOCKS5 proxy port (current: " + std::to_string(settings.proxyPort) + ", 1-65535): ",
+                   "Порт SOCKS5 прокси (текущий: " + std::to_string(settings.proxyPort) + ", 1-65535): "),
+                lang);
             if (!portStr.empty()) {
                 try {
-                    int newPort = std::stoi(portStr);
-                    if (newPort >= 1 && newPort <= 65535) {
-                        settings.proxyPort = newPort;
-                    } else {
-                        std::cout << tr(settings.language, "Invalid port. Must be 1-65535.", "Неверный порт. Должен быть в диапазоне 1-65535.") << "\n";
-                        pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
-                    }
-                } catch (...) {
-                    std::cout << tr(settings.language, "Invalid input.", "Неверный ввод.") << "\n";
-                    pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
-                }
+                    int p = std::stoi(portStr);
+                    if (p >= 1 && p <= 65535) settings.proxyPort = p;
+                    else { std::cout << tr(lang, "Invalid port.", "Неверный порт.") << "\n"; pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша...")); }
+                } catch (...) { std::cout << tr(lang, "Invalid input.", "Неверный ввод.") << "\n"; pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша...")); }
             }
-        } else if (key == '7') {
-            clearScreen();
+        } else if (option == 6) {
+            std::string portStr = inputString(
+                tr(lang,
+                   "HTTP proxy port (current: " + std::to_string(settings.httpProxyPort) + ", 0 to disable, 1-65535): ",
+                   "Порт HTTP прокси (текущий: " + std::to_string(settings.httpProxyPort) + ", 0 = откл, 1-65535): "),
+                lang);
+            if (!portStr.empty()) {
+                try {
+                    int p = std::stoi(portStr);
+                    if (p == 0 || (p >= 1 && p <= 65535)) settings.httpProxyPort = p;
+                    else { std::cout << tr(lang, "Invalid port.", "Неверный порт.") << "\n"; pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша...")); }
+                } catch (...) { std::cout << tr(lang, "Invalid input.", "Неверный ввод.") << "\n"; pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша...")); }
+            }
+        } else if (option == 7) {
             std::string dns = inputString(
-                tr(settings.language,
-                   "Enter DNS servers (current: " + settings.dnsServers + ", comma-separated): ",
-                   "Введите DNS серверы (текущие: " + settings.dnsServers + ", через запятую): "),
-                settings.language);
-            if (!dns.empty()) {
-                settings.dnsServers = dns;
-            }
+                tr(lang,
+                   "DNS servers (current: " + settings.dnsServers + ", comma-separated, e.g. 8.8.8.8,1.1.1.1): ",
+                   "DNS серверы (текущие: " + settings.dnsServers + ", через запятую, напр. 8.8.8.8,1.1.1.1): "),
+                lang);
+            if (!dns.empty()) settings.dnsServers = dns;
+        } else if (option == 8) {
+            std::string sub = inputString(
+                tr(lang,
+                   "Tunnel subnet CIDR (current: " + settings.tunnelSubnet + ", e.g. 10.8.0.1/30): ",
+                   "CIDR подсети туннеля (текущая: " + settings.tunnelSubnet + ", напр. 10.8.0.1/30): "),
+                lang);
+            if (!sub.empty()) settings.tunnelSubnet = sub;
+        } else if (option == 9) {
+            std::string iface = inputString(
+                tr(lang,
+                   "TUN interface name (current: " + settings.tunInterface + ", 'auto' = OS chooses): ",
+                   "Имя TUN интерфейса (текущее: " + settings.tunInterface + ", 'auto' = выбирает ОС): "),
+                lang);
+            if (!iface.empty()) settings.tunInterface = iface;
+        } else if (option == 10) {
+            settings.killSwitch = !settings.killSwitch;
+            std::cout << tr(lang, "Kill-switch: ", "Kill-switch: ")
+                      << (settings.killSwitch ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
+            pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
+        } else if (option == 11) {
+            settings.enableIPv6 = !settings.enableIPv6;
+            std::cout << tr(lang, "IPv6 tunnel: ", "IPv6 туннель: ")
+                      << (settings.enableIPv6 ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
+            pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
+        } else if (option == 12) {
+            settings.splitTunnel = !settings.splitTunnel;
+            std::cout << tr(lang, "Split-tunnel: ", "Split-tunnel: ")
+                      << (settings.splitTunnel ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
+            pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
         }
     }
 }
@@ -624,14 +703,21 @@ void saveSettings(const Settings& settings) {
     std::string path = getDataDir() + "/settings.dat";
     std::ofstream file(path);
     if (!file.is_open()) return;
-    file << "autoStart=" << (settings.autoStart ? "1" : "0") << "\n";
-    file << "useProxy=" << (settings.useProxy ? "1" : "0") << "\n";
-    file << "logLevel=" << settings.logLevel << "\n";
-    file << "language=" << (settings.language == Language::RU ? "RU" : "EN") << "\n";
-    file << "xrayCoreDir=" << settings.xrayCoreDir << "\n";
+    file << "autoStart="     << (settings.autoStart     ? "1" : "0") << "\n";
+    file << "useProxy="      << (settings.useProxy       ? "1" : "0") << "\n";
+    file << "logLevel="      << settings.logLevel        << "\n";
+    file << "language="      << (settings.language == Language::RU ? "RU" : "EN") << "\n";
+    file << "xrayCoreDir="   << settings.xrayCoreDir    << "\n";
     file << "systemVpnMode=" << (settings.systemVpnMode ? "1" : "0") << "\n";
-    file << "dnsServers=" << settings.dnsServers << "\n";
-    file << "proxyPort=" << settings.proxyPort << "\n";
+    file << "dnsServers="    << settings.dnsServers      << "\n";
+    file << "proxyPort="     << settings.proxyPort       << "\n";
+    // Tunnel / TUN settings
+    file << "tunnelSubnet="  << settings.tunnelSubnet    << "\n";
+    file << "tunInterface="  << settings.tunInterface    << "\n";
+    file << "killSwitch="    << (settings.killSwitch     ? "1" : "0") << "\n";
+    file << "httpProxyPort=" << settings.httpProxyPort   << "\n";
+    file << "enableIPv6="    << (settings.enableIPv6     ? "1" : "0") << "\n";
+    file << "splitTunnel="   << (settings.splitTunnel    ? "1" : "0") << "\n";
 }
 
 void loadSettings(Settings& settings) {
@@ -645,20 +731,26 @@ void loadSettings(Settings& settings) {
         if (eq == std::string::npos) continue;
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
-        if (key == "autoStart")     settings.autoStart     = (val == "1");
-        else if (key == "useProxy") settings.useProxy      = (val == "1");
+        if (key == "autoStart")          settings.autoStart     = (val == "1");
+        else if (key == "useProxy")      settings.useProxy      = (val == "1");
         else if (key == "logLevel") {
             try { settings.logLevel = std::stoi(val); } catch (...) {}
         }
-        else if (key == "language") settings.language = (val == "RU" ? Language::RU : Language::EN);
+        else if (key == "language")      settings.language      = (val == "RU" ? Language::RU : Language::EN);
         else if (key == "xrayCoreDir")   settings.xrayCoreDir   = val;
         else if (key == "systemVpnMode") settings.systemVpnMode = (val == "1");
         else if (key == "dnsServers")    settings.dnsServers    = val;
         else if (key == "proxyPort") {
-            try {
-                int p = std::stoi(val);
-                if (p >= 1 && p <= 65535) settings.proxyPort = p;
-            } catch (...) {}
+            try { int p = std::stoi(val); if (p >= 1 && p <= 65535) settings.proxyPort = p; } catch (...) {}
         }
+        // Tunnel / TUN settings
+        else if (key == "tunnelSubnet")  settings.tunnelSubnet  = val;
+        else if (key == "tunInterface")  settings.tunInterface  = val;
+        else if (key == "killSwitch")    settings.killSwitch    = (val == "1");
+        else if (key == "httpProxyPort") {
+            try { int p = std::stoi(val); if (p >= 0 && p <= 65535) settings.httpProxyPort = p; } catch (...) {}
+        }
+        else if (key == "enableIPv6")    settings.enableIPv6    = (val == "1");
+        else if (key == "splitTunnel")   settings.splitTunnel   = (val == "1");
     }
 }

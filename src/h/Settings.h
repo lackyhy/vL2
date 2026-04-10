@@ -37,8 +37,23 @@ struct Settings {
     Language language = Language::EN;
     std::string xrayCoreDir = "./xray";
     bool systemVpnMode = false;
-    std::string dnsServers = "8.8.8.8,8.8.4.4";
+    std::string dnsServers = "8.8.8.8,1.1.1.1";
     int proxyPort = 1080;   // local inbound port for SOCKS/HTTP/tunnel
+
+    // ── Tunnel / TUN interface settings ──────────────────────────────────────
+    // IP address assigned to the TUN interface (CIDR notation).
+    // Xray creates the interface automatically when tun inbound is used.
+    std::string tunnelSubnet = "10.8.0.1/30";
+    // Interface name hint ("auto" lets xray/OS choose, e.g. utun5, tun0).
+    std::string tunInterface = "auto";
+    // Kill-switch: block all non-VPN traffic when xray-core is not running.
+    bool killSwitch = false;
+    // Secondary HTTP proxy port (0 = disabled, only SOCKS is used).
+    int httpProxyPort = 8080;
+    // Route IPv6 traffic through the tunnel as well.
+    bool enableIPv6 = false;
+    // Split-tunnel: when false, only route all traffic through VPN.
+    bool splitTunnel = false;
 };
 
 #endif // VL2_SETTINGS_H

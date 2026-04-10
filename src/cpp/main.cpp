@@ -15,11 +15,13 @@ int main() {
     int selected = 0;
     bool trayMode = false;
     bool xrayRunning = false;
-    bool tunnelModeActive = false;
-    bool systemVpnActive = false;
-    ProcessId activePid = 0;
+    bool tunnelModeActive = false;   // legacy transparent-proxy tunnel
+    bool tunModeActive    = false;   // real TUN virtual interface mode
+    bool systemVpnActive  = false;
+    ProcessId activePid   = 0;
     std::string listenAddress;
     std::string activeLogFile;
+    std::string activeTunIface;      // e.g. "utun5", "tun0"
 
     signal(SIGINT, SIG_IGN);
     loadSettings(settings);
@@ -102,22 +104,33 @@ int main() {
         std::cout << "=== " << mFile::APP_NAME << " " << mFile::APP_VERSION << " ===\n";
         std::cout << mFile::APP_DESCRIPTION << "\n";
         if (xrayRunning) {
-            std::cout << tr(settings.language, "Active xray-core PID:", "Активный PID xray-core:") << " " << activePid << "\n";
-            std::cout << tr(settings.language, "Listening on:", "Слушает:") << " " << listenAddress << "\n";
+            std::cout << tr(settings.language, "xray-core PID:", "PID xray-core:") << " " << activePid;
+            if (tunModeActive) {
+                std::cout << "  [TUN: " << activeTunIface << "  " << settings.tunnelSubnet << "]";
+            } else if (tunnelModeActive) {
+                std::cout << "  [" << tr(settings.language, "transparent proxy", "прозрачный прокси") << "]";
+            } else {
+                std::cout << "  [" << tr(settings.language, "proxy", "прокси") << ": " << listenAddress << "]";
+            }
+            if (settings.killSwitch && tunModeActive) {
+                std::cout << "  [kill-switch]";
+            }
+            std::cout << "\n";
         }
         std::cout << "\n";
-        std::cout << tr(settings.language, "Use arrow keys or type a number to choose.", "Используйте стрелки или введите цифру для выбора.") << "\n";
-        std::cout << tr(settings.language, "Press Enter to execute. Press Q to quit.", "Нажмите Enter для выполнения. Q — выход.") << "\n\n";
+        std::cout << tr(settings.language, "Arrow keys / number + Enter to select.  Q = quit.  Ctrl+F = minimize.",
+                                           "Стрелки / цифра + Enter для выбора.  Q = выход.  Ctrl+F = свернуть.") << "\n\n";
 
         std::vector<std::string> menuItems = {
-            tr(settings.language, "Launch xray-core", "Запустить xray-core"),
+            tr(settings.language, "Launch xray-core (proxy)", "Запустить xray-core (прокси)"),
+            tr(settings.language, "Launch TUN tunnel (virtual interface)", "Запустить TUN туннель (виртуальный интерфейс)"),
             tr(settings.language, "Profiles", "Профили"),
             tr(settings.language, "Settings", "Настройки")
         };
         if (xrayRunning) {
             menuItems.push_back(tr(settings.language, "Show xray-core status", "Показать статус xray-core"));
-            if (tunnelModeActive) {
-                std::string vpnStatus = systemVpnActive ? 
+            if (tunnelModeActive && !tunModeActive) {
+                std::string vpnStatus = systemVpnActive ?
                     tr(settings.language, "Disable system VPN", "Отключить системный VPN") :
                     tr(settings.language, "Enable system VPN", "Включить системный VPN");
                 menuItems.push_back(vpnStatus);
@@ -139,9 +152,9 @@ int main() {
         if (key == 'q' || key == 'Q') { // q/Q — exit
             showCursor();
             clearScreen();
-            if (systemVpnActive) {
-                cleanupSystemVPN(settings);
-            }
+            if (systemVpnActive) cleanupSystemVPN(settings);
+            if (tunModeActive)   cleanupTunVPN(settings);
+            if (activePid > 0)   stopXrayCore(activePid);
             std::cout << tr(settings.language, "Exit...", "Выход...") << "\n";
             return 0;
         }
@@ -160,6 +173,8 @@ int main() {
                 showCursor();
                 clearScreen();
                 if (systemVpnActive) cleanupSystemVPN(settings);
+                if (tunModeActive)   cleanupTunVPN(settings);
+                if (activePid > 0)   stopXrayCore(activePid);
                 std::cout << tr(settings.language, "Exit...", "Выход...") << "\n";
                 return 0;
             }
@@ -186,81 +201,74 @@ int main() {
 
         if (key == '\n' || key == '\r') {
             std::string selectedItem = menuItems[selected];
-            std::string launchStr = tr(settings.language, "Launch xray-core", "Запустить xray-core");
-            std::string profilesStr = tr(settings.language, "Profiles", "Профили");
-            std::string settingsStr = tr(settings.language, "Settings", "Настройки");
-            std::string statusStr = tr(settings.language, "Show xray-core status", "Показать статус xray-core");
+            std::string launchStr    = tr(settings.language, "Launch xray-core (proxy)", "Запустить xray-core (прокси)");
+            std::string tunLaunchStr = tr(settings.language, "Launch TUN tunnel (virtual interface)", "Запустить TUN туннель (виртуальный интерфейс)");
+            std::string profilesStr  = tr(settings.language, "Profiles", "Профили");
+            std::string settingsStr  = tr(settings.language, "Settings", "Настройки");
+            std::string statusStr    = tr(settings.language, "Show xray-core status", "Показать статус xray-core");
             std::string vpnEnableStr = tr(settings.language, "Enable system VPN", "Включить системный VPN");
-            std::string vpnDisableStr = tr(settings.language, "Disable system VPN", "Отключить системный VPN");
-            std::string stopStr = tr(settings.language, "Stop xray-core", "Остановить xray-core");
-            std::string exitStr = tr(settings.language, "Exit", "Выход");
-            
+            std::string vpnDisableStr= tr(settings.language, "Disable system VPN", "Отключить системный VPN");
+            std::string stopStr      = tr(settings.language, "Stop xray-core", "Остановить xray-core");
+            std::string exitStr      = tr(settings.language, "Exit", "Выход");
+
+            // ── Helper: pick a profile by key press ───────────────────────────
+            auto pickProfile = [&]() -> int {
+                clearScreen();
+                std::cout << tr(settings.language, "Select profile:", "Выберите профиль:") << "\n\n";
+                for (size_t i = 0; i < profiles.size(); ++i) {
+                    std::cout << i + 1 << ". " << profiles[i].name
+                              << " (" << profiles[i].type << ") @ " << profiles[i].address << "\n";
+                }
+                std::cout << "\n" << tr(settings.language, "Press number key (1-9), or 0 to cancel: ", "Нажмите цифру (1-9) или 0 для отмены: ");
+                int k = readKey();
+                if (k >= '1' && k <= '0' + static_cast<int>(profiles.size())) return k - '1';
+                return -1; // cancelled
+            };
+
             if (selectedItem == launchStr) {
-                // Launch xray-core
+                // ── Proxy / transparent-proxy mode ────────────────────────────
                 if (profiles.empty()) {
                     clearScreen();
                     std::cout << tr(settings.language, "No profiles available. Add profiles first.", "Нет доступных профилей. Сначала добавьте профили.") << "\n";
                     pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
                 } else {
-                    // Show profiles and select one
-                    clearScreen();
-                    std::cout << tr(settings.language, "Select profile to launch:", "Выберите профиль для запуска:") << "\n\n";
-                    for (size_t i = 0; i < profiles.size(); ++i) {
-                        std::cout << i + 1 << ". " << profiles[i].name << " (" << profiles[i].type << ")\n";
-                    }
-                    std::cout << "\n" << tr(settings.language, "Enter number (1-", "Введите номер (1-") << profiles.size() << "): ";
-                    std::string choiceLine;
-                    std::getline(std::cin >> std::ws, choiceLine);
-                    int choice = 0;
-                    try {
-                        choice = std::stoi(choiceLine);
-                    } catch (...) {
-                        choice = 0;
-                    }
-                    if (choice >= 1 && choice <= static_cast<int>(profiles.size())) {
+                    int idx = pickProfile();
+                    if (idx >= 0) {
                         clearScreen();
-                        std::cout << tr(settings.language, "Choose launch mode:", "Выберите режим запуска:") << "\n";
-                        std::cout << "1. " << tr(settings.language, "Proxy mode", "Режим прокси") << "\n";
-                        std::cout << "2. " << tr(settings.language, "Tunnel mode", "Режим туннеля") << "\n";
-                        std::cout << tr(settings.language, "Press 1 or 2:", "Нажмите 1 или 2:") << " ";
-                        int modeChoice = 0;
-                        std::string modeLine;
-                        std::getline(std::cin >> std::ws, modeLine);
-                        try {
-                            modeChoice = std::stoi(modeLine);
-                        } catch (...) {
-                            modeChoice = 0;
-                        }
-                        bool tunnelMode = (modeChoice == 2);
-                        std::string proxyProtocol = "socks";
-                        
-                        if (!tunnelMode) {
-                            // Choose proxy protocol
-                            clearScreen();
-                            std::cout << tr(settings.language, "Choose proxy protocol:", "Выберите протокол прокси:") << "\n";
-                            std::cout << "1. SOCKS5\n";
-                            std::cout << "2. HTTP\n";
-                            std::cout << tr(settings.language, "Press 1 or 2:", "Нажмите 1 или 2:") << " ";
-                            int protocolChoice = 0;
-                            std::string protocolLine;
-                            std::getline(std::cin >> std::ws, protocolLine);
-                            try {
-                                protocolChoice = std::stoi(protocolLine);
-                            } catch (...) {
-                                protocolChoice = 1;
-                            }
-                            proxyProtocol = (protocolChoice == 2) ? "http" : "socks";
-                        }
-                        
-                        if (launchXrayCore(settings, profiles[choice - 1], tunnelMode, proxyProtocol, activeLogFile, listenAddress, activePid)) {
-                            xrayRunning = true;
-                            tunnelModeActive = tunnelMode;
-                            systemVpnActive = false;
+                        std::cout << tr(settings.language, "Proxy protocol:", "Протокол прокси:") << "\n";
+                        std::cout << "1. SOCKS5\n";
+                        std::cout << "2. HTTP\n";
+                        std::cout << tr(settings.language, "Press 1 or 2 (default SOCKS5): ", "Нажмите 1 или 2 (по умолч. SOCKS5): ");
+                        int pk = readKey();
+                        std::string proxyProtocol = (pk == '2') ? "http" : "socks";
+                        if (launchXrayCore(settings, profiles[idx], false, proxyProtocol,
+                                           activeLogFile, listenAddress, activePid)) {
+                            xrayRunning      = true;
+                            tunnelModeActive = false;
+                            tunModeActive    = false;
+                            systemVpnActive  = false;
                             showXrayLog(activeLogFile, settings.language);
                         }
-                    } else {
-                        std::cout << tr(settings.language, "Invalid choice.", "Неверный выбор.") << "\n";
-                        pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+                    }
+                }
+            } else if (selectedItem == tunLaunchStr) {
+                // ── TUN virtual-interface mode ────────────────────────────────
+                if (profiles.empty()) {
+                    clearScreen();
+                    std::cout << tr(settings.language, "No profiles available. Add profiles first.", "Нет доступных профилей. Сначала добавьте профили.") << "\n";
+                    pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+                } else {
+                    int idx = pickProfile();
+                    if (idx >= 0) {
+                        if (launchXrayTun(settings, profiles[idx],
+                                          activeLogFile, activeTunIface, activePid)) {
+                            xrayRunning      = true;
+                            tunModeActive    = true;
+                            tunnelModeActive = false;
+                            systemVpnActive  = false;
+                            listenAddress    = "127.0.0.1:" + std::to_string(settings.proxyPort);
+                            showXrayLog(activeLogFile, settings.language);
+                        }
                     }
                 }
             } else if (selectedItem == profilesStr) {
@@ -273,18 +281,47 @@ int main() {
                 hideCursor();
             } else if (selectedItem == statusStr) {
                 clearScreen();
-                std::cout << tr(settings.language, "xray-core status:", "Статус xray-core:") << "\n";
-                std::cout << tr(settings.language, "Running PID:", "Запущен PID:") << " " << activePid << "\n";
-                std::cout << tr(settings.language, "Listening on:", "Слушает:") << " " << listenAddress << "\n";
-                if (tunnelModeActive) {
-                    std::cout << "\n" << tr(settings.language, "Tunnel mode active", "Режим туннеля активен") << "\n";
+                std::cout << "=== " << tr(settings.language, "xray-core status", "Статус xray-core") << " ===\n\n";
+                std::cout << tr(settings.language, "PID:", "PID:") << " " << activePid << "\n";
+                std::cout << tr(settings.language, "Log file:", "Файл лога:") << " " << activeLogFile << "\n";
+
+                if (tunModeActive) {
+                    std::cout << "\n" << tr(settings.language, "Mode: TUN tunnel (virtual interface)", "Режим: TUN туннель (виртуальный интерфейс)") << "\n";
+                    std::cout << tr(settings.language, "Interface: ", "Интерфейс: ") << activeTunIface << "\n";
+                    std::cout << tr(settings.language, "Subnet:    ", "Подсеть:    ") << settings.tunnelSubnet << "\n";
+                    std::cout << tr(settings.language, "Kill-switch: ", "Kill-switch: ")
+                              << (settings.killSwitch ? tr(settings.language, "ON", "ВКЛ") : tr(settings.language, "OFF", "ВЫКЛ")) << "\n";
+                    std::cout << tr(settings.language, "Split-tunnel: ", "Split-tunnel: ")
+                              << (settings.splitTunnel ? tr(settings.language, "ON", "ВКЛ") : tr(settings.language, "OFF", "ВЫКЛ")) << "\n";
+                    if (settings.proxyPort > 0)
+                        std::cout << "SOCKS5: 127.0.0.1:" << settings.proxyPort << "\n";
+                    if (settings.httpProxyPort > 0)
+                        std::cout << "HTTP:   127.0.0.1:" << settings.httpProxyPort << "\n";
+#if defined(__linux__)
+                    std::cout << "\n";
+                    system("ip link show 2>/dev/null | grep 'tun' || true");
+                    system("ip route show 2>/dev/null | head -6");
+#elif defined(__APPLE__)
+                    std::cout << "\n";
+                    system("ifconfig 2>/dev/null | grep -A4 'utun' | head -20");
+                    system("netstat -rn 2>/dev/null | head -12");
+#endif
+                } else if (tunnelModeActive) {
+                    std::cout << "\n" << tr(settings.language, "Mode: transparent proxy (dokodemo-door)", "Режим: прозрачный прокси (dokodemo-door)") << "\n";
+                    std::cout << tr(settings.language, "Listening on: ", "Слушает: ") << listenAddress << "\n";
                     if (systemVpnActive) {
-                        std::cout << tr(settings.language, "System VPN enabled", "Системный VPN включен") << "\n";
-                        std::cout << tr(settings.language, "Active pfctl redirect rules:", "Активные правила перенаправления pfctl:") << "\n";
-                        system("sudo pfctl -s rules 2>/dev/null | grep 'rdr' || echo 'No redirect rules found'");
+                        std::cout << tr(settings.language, "System VPN: ON", "Системный VPN: ВКЛ") << "\n";
+#ifdef __APPLE__
+                        system("sudo pfctl -s rules 2>/dev/null | grep 'rdr' || echo '(no redirect rules)'");
+#elif defined(__linux__)
+                        system("sudo iptables -t nat -L OUTPUT --line-numbers 2>/dev/null | head -10");
+#endif
                     } else {
-                        std::cout << tr(settings.language, "System VPN disabled", "Системный VPN отключен") << "\n";
+                        std::cout << tr(settings.language, "System VPN: OFF (use 'Enable system VPN' to route all traffic)", "Системный VPN: ВЫКЛ (используйте 'Включить системный VPN' для маршрутизации всего трафика)") << "\n";
                     }
+                } else {
+                    std::cout << "\n" << tr(settings.language, "Mode: proxy", "Режим: прокси") << "\n";
+                    std::cout << tr(settings.language, "Listening on: ", "Слушает: ") << listenAddress << "\n";
                 }
                 pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
             } else if (selectedItem == vpnEnableStr) {
@@ -299,11 +336,17 @@ int main() {
                     cleanupSystemVPN(settings);
                     systemVpnActive = false;
                 }
+                if (tunModeActive) {
+                    cleanupTunVPN(settings);
+                    tunModeActive   = false;
+                    activeTunIface.clear();
+                }
                 if (stopXrayCore(activePid)) {
-                    std::cout << tr(settings.language, "xray-core stopped successfully.", "xray-core успешно остановлен.") << "\n";
-                    activePid = 0;
-                    xrayRunning = false;
+                    std::cout << tr(settings.language, "xray-core stopped.", "xray-core остановлен.") << "\n";
+                    activePid        = 0;
+                    xrayRunning      = false;
                     tunnelModeActive = false;
+                    listenAddress.clear();
                 } else {
                     std::cout << tr(settings.language, "Failed to stop xray-core.", "Не удалось остановить xray-core.") << "\n";
                 }
@@ -311,9 +354,9 @@ int main() {
             } else if (selectedItem == exitStr) {
                 showCursor();
                 clearScreen();
-                if (systemVpnActive) {
-                    cleanupSystemVPN(settings);
-                }
+                if (systemVpnActive) cleanupSystemVPN(settings);
+                if (tunModeActive)   cleanupTunVPN(settings);
+                if (activePid > 0)   stopXrayCore(activePid);
                 std::cout << tr(settings.language, "Exit...", "Выход...") << "\n";
                 return 0;
             }

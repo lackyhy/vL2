@@ -79,14 +79,15 @@ static void showContextMenu(HWND hWnd) {
     // Post a dummy message so the menu disappears cleanly (Windows quirk)
     PostMessage(hWnd, WM_NULL, 0, 0);
 
+    // NOTE: PostMessage(WM_NULL) above already wakes the message loop.
+    // Do NOT call PostQuitMessage — that leaves a stale WM_QUIT which
+    // causes an immediate exit on the next tray session (the ^F crash).
     switch (cmd) {
         case IDM_RESTORE:
             g_restore = true;
-            PostQuitMessage(0);
             break;
         case IDM_EXIT:
             g_exit = true;
-            PostQuitMessage(0);
             break;
         case IDM_LOGS:
             g_logs = !g_logs;
@@ -104,14 +105,16 @@ static LRESULT CALLBACK TrayWndProc(HWND hWnd, UINT msg,
         if (ev == WM_RBUTTONUP) {
             showContextMenu(hWnd);
         } else if (ev == WM_LBUTTONDBLCLK) {
-            // Double-click = restore
+            // Double-click = restore. Set flag and post WM_NULL to wake the
+            // message loop — do NOT call PostQuitMessage here because that
+            // leaves a stale WM_QUIT in the queue which kills the next session.
             g_restore = true;
-            PostQuitMessage(0);
+            PostMessage(hWnd, WM_NULL, 0, 0);
         }
         return 0;
     }
     if (msg == WM_DESTROY) {
-        PostQuitMessage(0);
+        // Do not PostQuitMessage — we drive the loop via g_restore/g_exit flags.
         return 0;
     }
     return DefWindowProcA(hWnd, msg, wParam, lParam);
@@ -123,6 +126,15 @@ TrayResult enterTrayMode(const TrayConfig& cfg) {
     g_logs    = cfg.logsEnabled;
     g_restore = false;
     g_exit    = false;
+
+    // ── Drain any stale WM_QUIT left by a previous tray session ────────────
+    // Without this, a leftover WM_QUIT causes GetMessageA to return 0
+    // immediately on the next call, making the loop exit with g_restore=false,
+    // which main.cpp interprets as "Exit" — the ^F re-open crash.
+    {
+        MSG stale;
+        while (PeekMessageA(&stale, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE)) {}
+    }
 
     // ── Hide console window ─────────────────────────────────────────────
     HWND hConsole = GetConsoleWindow();
@@ -142,6 +154,14 @@ TrayResult enterTrayMode(const TrayConfig& cfg) {
                               nullptr,
                               GetModuleHandleA(nullptr),
                               nullptr);
+    if (!hWnd) {
+        // Window creation failed — restore console and bail out gracefully.
+        if (hConsole) ShowWindow(hConsole, SW_SHOW);
+        TrayResult r;
+        r.restore     = true;
+        r.logsEnabled = cfg.logsEnabled;
+        return r;
+    }
 
     // ── Build tray icon ─────────────────────────────────────────────────
     // Try to load the app's own icon first; fall back to generic one

@@ -81,23 +81,28 @@ std::string generateConfig(const Profile& profile, bool tunnelMode, const std::s
 )";
 
     if (profile.type == "VLESS") {
-        // Parse address: host:port
         std::regex addrRegex(R"(([^:]+):(\d+))");
         std::smatch match;
         if (std::regex_match(profile.address, match, addrRegex)) {
-            std::string host = match[1].str();
-            std::string port = match[2].str();
-            std::string uuid = profile.uuid.empty() ? "fc1e5950-d7eb-4032-a22f-67031e41c8b6" : profile.uuid;
+            std::string host       = match[1].str();
+            std::string portStr    = match[2].str();
+            std::string uuid       = profile.uuid.empty() ? "fc1e5950-d7eb-4032-a22f-67031e41c8b6" : profile.uuid;
             std::string encryption = profile.encryption.empty() ? "none" : profile.encryption;
-            std::string flow = profile.flow;
-            
+            std::string flow       = profile.flow;
+            std::string security   = profile.security;   // "reality", "tls", or ""
+            std::string sni        = profile.sni.empty() ? host : profile.sni;
+            std::string fp         = profile.fingerprint.empty() ? "chrome" : profile.fingerprint;
+            std::string pubKey     = profile.publicKey;
+            std::string shortId    = profile.shortId;
+            std::string spiderX    = profile.spiderX.empty() ? "/" : profile.spiderX;
+
             oss << R"(
       "protocol": "vless",
       "settings": {
         "vnext": [
           {
             "address": ")" << host << R"(",
-            "port": )" << port << R"(,
+            "port": )" << portStr << R"(,
             "users": [
               {
                 "id": ")" << uuid << R"(",
@@ -111,49 +116,102 @@ std::string generateConfig(const Profile& profile, bool tunnelMode, const std::s
       },
       "streamSettings": {
         "network": "tcp",
-        "security": "reality",
+        "security": ")" << (security.empty() ? "none" : security) << R"(")"
+;
+            if (security == "reality") {
+                oss << R"(,
         "realitySettings": {
-          "serverName": "www.apple.com",
-          "fingerprint": "chrome",
-          "publicKey": "Y0jh08ES3fy99G7kYHOa7K7BxQuclneLl1GMcpe3MyA",
-          "shortId": "95",
-          "spiderX": "/"
-
-        }
+          "serverName": ")" << sni << R"(",
+          "fingerprint": ")" << fp << R"(",
+          "publicKey": ")" << pubKey << R"(",
+          "shortId": ")" << shortId << R"(",
+          "spiderX": ")" << spiderX << R"("
+        })";
+            } else if (security == "tls") {
+                oss << R"(,
+        "tlsSettings": {
+          "serverName": ")" << sni << R"(",
+          "fingerprint": ")" << fp << R"(",
+          "allowInsecure": false
+        })";
+            }
+            oss << R"(
       }
 )";
         }
     } else if (profile.type == "VMess") {
-        // Similar for VMess
         std::regex addrRegex(R"(([^:]+):(\d+))");
         std::smatch match;
-        std::string host = "example.com";
-        std::string port = "443";
+        std::string host    = "example.com";
+        std::string portStr = "443";
         if (std::regex_match(profile.address, match, addrRegex)) {
-            host = match[1].str();
-            port = match[2].str();
+            host    = match[1].str();
+            portStr = match[2].str();
         }
-        std::string uuid = profile.uuid.empty() ? "uuid" : profile.uuid;
-        
+        std::string uuid       = profile.uuid.empty() ? "uuid" : profile.uuid;
+        std::string encryption = profile.encryption.empty() ? "auto" : profile.encryption;
+        std::string security   = profile.security;
+        std::string sni        = profile.sni.empty() ? host : profile.sni;
+        std::string fp         = profile.fingerprint.empty() ? "chrome" : profile.fingerprint;
+
         oss << R"(
       "protocol": "vmess",
       "settings": {
         "vnext": [
           {
             "address": ")" << host << R"(",
-            "port": )" << port << R"(,
+            "port": )" << portStr << R"(,
             "users": [
               {
                 "id": ")" << uuid << R"(",
+                "security": ")" << encryption << R"(",
                 "alterId": 0
               }
             ]
           }
         ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": ")" << (security.empty() ? "none" : security) << R"(")"
+;
+        if (security == "tls") {
+            oss << R"(,
+        "tlsSettings": {
+          "serverName": ")" << sni << R"(",
+          "fingerprint": ")" << fp << R"(",
+          "allowInsecure": false
+        })";
+        }
+        oss << R"(
+      }
+)";
+    } else if (profile.type == "Shadowsocks") {
+        std::regex addrRegex(R"(([^:]+):(\d+))");
+        std::smatch match;
+        std::string host    = "example.com";
+        std::string portStr = "8388";
+        if (std::regex_match(profile.address, match, addrRegex)) {
+            host    = match[1].str();
+            portStr = match[2].str();
+        }
+        std::string method   = profile.method.empty() ? "aes-256-gcm" : profile.method;
+        std::string password = profile.password;
+
+        oss << R"(
+      "protocol": "shadowsocks",
+      "settings": {
+        "servers": [
+          {
+            "address": ")" << host << R"(",
+            "port": )" << portStr << R"(,
+            "method": ")" << method << R"(",
+            "password": ")" << password << R"("
+          }
+        ]
       }
 )";
     } else {
-        // Default
         oss << R"(
       "protocol": "freedom"
 )";
@@ -163,7 +221,7 @@ std::string generateConfig(const Profile& profile, bool tunnelMode, const std::s
     }
   ],
   "routing": {
-    "domainStrategy": "AsIs",
+    "domainStrategy": "IPIfNonMatch",
     "rules": [
       {
         "type": "field",
@@ -177,6 +235,264 @@ std::string generateConfig(const Profile& profile, bool tunnelMode, const std::s
   }
 }
 )";
+    return oss.str();
+}
+
+// ── Helper: emit only the outbound block (protocol-specific JSON) ──────────
+// Used by both generateConfig and generateTunConfig to avoid duplication.
+static void appendOutbound(std::ostringstream& oss, const Profile& profile) {
+    if (profile.type == "VLESS") {
+        std::regex addrRegex(R"(([^:]+):(\d+))");
+        std::smatch match;
+        if (!std::regex_match(profile.address, match, addrRegex)) return;
+
+        std::string host       = match[1].str();
+        std::string portStr    = match[2].str();
+        std::string uuid       = profile.uuid.empty() ? "fc1e5950-d7eb-4032-a22f-67031e41c8b6" : profile.uuid;
+        std::string encryption = profile.encryption.empty() ? "none" : profile.encryption;
+        std::string flow       = profile.flow;
+        std::string security   = profile.security;
+        std::string sni        = profile.sni.empty() ? host : profile.sni;
+        std::string fp         = profile.fingerprint.empty() ? "chrome" : profile.fingerprint;
+        std::string pubKey     = profile.publicKey;
+        std::string shortId    = profile.shortId;
+        std::string spiderX    = profile.spiderX.empty() ? "/" : profile.spiderX;
+
+        oss << R"(
+      "protocol": "vless",
+      "settings": {
+        "vnext": [{
+          "address": ")" << host << R"(",
+          "port": )" << portStr << R"(,
+          "users": [{
+            "id": ")" << uuid << R"(",
+            "encryption": ")" << encryption << R"(")"
+            << (flow.empty() ? "" : ",\n            \"flow\": \"" + flow + "\"")
+            << R"(
+          }]
+        }]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": ")" << (security.empty() ? "none" : security) << R"(")"
+;
+        if (security == "reality") {
+            oss << R"(,
+        "realitySettings": {
+          "serverName": ")" << sni << R"(",
+          "fingerprint": ")" << fp << R"(",
+          "publicKey": ")" << pubKey << R"(",
+          "shortId": ")" << shortId << R"(",
+          "spiderX": ")" << spiderX << R"("
+        })";
+        } else if (security == "tls") {
+            oss << R"(,
+        "tlsSettings": {
+          "serverName": ")" << sni << R"(",
+          "fingerprint": ")" << fp << R"(",
+          "allowInsecure": false
+        })";
+        }
+        oss << R"(
+      })";
+    } else if (profile.type == "VMess") {
+        std::regex addrRegex(R"(([^:]+):(\d+))");
+        std::smatch match;
+        std::string host    = "example.com";
+        std::string portStr = "443";
+        if (std::regex_match(profile.address, match, addrRegex)) {
+            host    = match[1].str();
+            portStr = match[2].str();
+        }
+        std::string uuid       = profile.uuid.empty() ? "uuid" : profile.uuid;
+        std::string encryption = profile.encryption.empty() ? "auto" : profile.encryption;
+        std::string security   = profile.security;
+        std::string sni        = profile.sni.empty() ? host : profile.sni;
+        std::string fp         = profile.fingerprint.empty() ? "chrome" : profile.fingerprint;
+
+        oss << R"(
+      "protocol": "vmess",
+      "settings": {
+        "vnext": [{
+          "address": ")" << host << R"(",
+          "port": )" << portStr << R"(,
+          "users": [{
+            "id": ")" << uuid << R"(",
+            "security": ")" << encryption << R"(",
+            "alterId": 0
+          }]
+        }]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": ")" << (security.empty() ? "none" : security) << R"(")"
+;
+        if (security == "tls") {
+            oss << R"(,
+        "tlsSettings": {
+          "serverName": ")" << sni << R"(",
+          "fingerprint": ")" << fp << R"(",
+          "allowInsecure": false
+        })";
+        }
+        oss << R"(
+      })";
+    } else if (profile.type == "Shadowsocks") {
+        std::regex addrRegex(R"(([^:]+):(\d+))");
+        std::smatch match;
+        std::string host    = "example.com";
+        std::string portStr = "8388";
+        if (std::regex_match(profile.address, match, addrRegex)) {
+            host    = match[1].str();
+            portStr = match[2].str();
+        }
+        oss << R"(
+      "protocol": "shadowsocks",
+      "settings": {
+        "servers": [{
+          "address": ")" << host << R"(",
+          "port": )" << portStr << R"(,
+          "method": ")" << (profile.method.empty() ? "aes-256-gcm" : profile.method) << R"(",
+          "password": ")" << profile.password << R"("
+        }]
+      })";
+    } else {
+        oss << R"(
+      "protocol": "freedom")";
+    }
+}
+
+// ── TUN-mode config (xray v5 tun inbound) ─────────────────────────────────
+// Xray creates the virtual network interface itself when this config is used.
+// Requires root/administrator on most platforms.
+std::string generateTunConfig(const Profile& profile, const Settings& settings) {
+    std::ostringstream oss;
+
+    std::string tunAddr  = settings.tunnelSubnet.empty() ? "10.8.0.1/30" : settings.tunnelSubnet;
+    std::string tunName  = (settings.tunInterface.empty() || settings.tunInterface == "auto")
+                           ? "" : settings.tunInterface;
+
+    // Build DNS list from settings
+    std::string dnsBlock;
+    {
+        std::istringstream dss(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
+        std::string srv;
+        bool first = true;
+        while (std::getline(dss, srv, ',')) {
+            if (srv.empty()) continue;
+            if (!first) dnsBlock += ", ";
+            dnsBlock += "\"" + srv + "\"";
+            first = false;
+        }
+    }
+
+    oss << "{\n"
+        << "  \"log\": { \"loglevel\": \"" << [&]() -> std::string {
+               switch (settings.logLevel) {
+                   case 1: return "debug";
+                   case 2: return "info";
+                   case 3: return "warning";
+                   case 4: return "error";
+                   case 5: return "none";
+                   default: return "warning";
+               }
+           }() << "\" },\n"
+        << "  \"dns\": { \"servers\": [" << dnsBlock << "] },\n"
+        << "  \"inbounds\": [\n"
+        << "    {\n"
+        << "      \"tag\": \"tun-in\",\n"
+        << "      \"protocol\": \"tun\",\n"
+        << "      \"settings\": {\n"
+        << "        \"address\": \"" << tunAddr << "\",\n";
+    if (!tunName.empty()) {
+        oss << "        \"name\": \"" << tunName << "\",\n";
+    }
+    oss << "        \"mtu\": 1450,\n"
+        << "        \"autoRoute\": true,\n"
+        << "        \"strictRoute\": " << (settings.killSwitch ? "true" : "false") << ",\n"
+        << "        \"endpointIndependentNat\": true\n"
+        << "      },\n"
+        << "      \"sniffing\": {\n"
+        << "        \"enabled\": true,\n"
+        << "        \"destOverride\": [\"http\", \"tls\", \"quic\"]\n"
+        << "      }\n"
+        << "    }";
+
+    // Optionally add an extra SOCKS inbound alongside the TUN so the user
+    // can still use it as a regular proxy from specific apps.
+    if (settings.proxyPort > 0) {
+        oss << ",\n"
+            << "    {\n"
+            << "      \"tag\": \"socks-in\",\n"
+            << "      \"port\": " << settings.proxyPort << ",\n"
+            << "      \"listen\": \"127.0.0.1\",\n"
+            << "      \"protocol\": \"socks\",\n"
+            << "      \"settings\": { \"auth\": \"noauth\" },\n"
+            << "      \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\", \"tls\"] }\n"
+            << "    }";
+    }
+    if (settings.httpProxyPort > 0) {
+        oss << ",\n"
+            << "    {\n"
+            << "      \"tag\": \"http-in\",\n"
+            << "      \"port\": " << settings.httpProxyPort << ",\n"
+            << "      \"listen\": \"127.0.0.1\",\n"
+            << "      \"protocol\": \"http\",\n"
+            << "      \"settings\": { \"timeout\": 360 },\n"
+            << "      \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\", \"tls\"] }\n"
+            << "    }";
+    }
+
+    oss << "\n  ],\n"
+        << "  \"outbounds\": [\n"
+        << "    {\n"
+        << "      \"tag\": \"proxy\"," ;
+    appendOutbound(oss, profile);
+    oss << "\n"
+        << "    },\n"
+        << "    {\n"
+        << "      \"tag\": \"direct\",\n"
+        << "      \"protocol\": \"freedom\",\n"
+        << "      \"settings\": {}\n"
+        << "    },\n"
+        << "    {\n"
+        << "      \"tag\": \"block\",\n"
+        << "      \"protocol\": \"blackhole\",\n"
+        << "      \"settings\": {}\n"
+        << "    }\n"
+        << "  ],\n"
+        << "  \"routing\": {\n"
+        << "    \"domainStrategy\": \"IPIfNonMatch\",\n"
+        << "    \"rules\": [\n"
+        // Direct: LAN/private addresses (do not tunnel local traffic)
+        << "      {\n"
+        << "        \"type\": \"field\",\n"
+        << "        \"ip\": [\"geoip:private\"],\n"
+        << "        \"outboundTag\": \"direct\"\n"
+        << "      },\n";
+    if (!settings.splitTunnel) {
+        // Route all traffic from the TUN interface through the proxy
+        oss << "      {\n"
+            << "        \"type\": \"field\",\n"
+            << "        \"inboundTag\": [\"tun-in\"],\n"
+            << "        \"outboundTag\": \"proxy\"\n"
+            << "      }\n";
+    } else {
+        // Split-tunnel: only route non-CN/private traffic through proxy
+        oss << "      {\n"
+            << "        \"type\": \"field\",\n"
+            << "        \"ip\": [\"geoip:cn\"],\n"
+            << "        \"outboundTag\": \"direct\"\n"
+            << "      },\n"
+            << "      {\n"
+            << "        \"type\": \"field\",\n"
+            << "        \"inboundTag\": [\"tun-in\"],\n"
+            << "        \"outboundTag\": \"proxy\"\n"
+            << "      }\n";
+    }
+    oss << "    ]\n"
+        << "  }\n"
+        << "}\n";
     return oss.str();
 }
 
@@ -417,6 +733,176 @@ bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunne
     }
     outListenAddress = listenAddress;
     pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+    return true;
+}
+
+// ── TUN-mode launcher ──────────────────────────────────────────────────────
+// Generates a TUN inbound config (xray v5+), writes it, and launches xray
+// with root/sudo so it can create the virtual network interface.
+// outIfaceName is populated with the interface name (e.g. "tun0", "utun5").
+bool launchXrayTun(const Settings& settings, const Profile& profile,
+                   std::string& outLogFile, std::string& outIfaceName, ProcessId& outPid) {
+    clearScreen();
+    Language lang = settings.language;
+    std::cout << "=== " << tr(lang, "Launch TUN Tunnel", "Запуск TUN туннеля") << " ===\n\n";
+
+    std::string binaryPath = findXrayCoreBinary(settings);
+    if (binaryPath.empty()) {
+        std::cout << tr(lang,
+            "xray-core binary not found. Put it in the xray/ folder first.",
+            "Бинарник xray-core не найден. Сначала поместите его в папку xray/.") << "\n";
+        pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+        return false;
+    }
+    std::cout << tr(lang, "Binary: ", "Бинарник: ") << binaryPath << "\n";
+
+    // Generate TUN config
+    std::string config = generateTunConfig(profile, settings);
+    std::ofstream configFile("config_tun.json");
+    if (!configFile) {
+        std::cout << tr(lang, "Failed to create config_tun.json", "Не удалось создать config_tun.json") << "\n";
+        pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+        return false;
+    }
+    configFile << config;
+    configFile.close();
+
+    outLogFile = "xray-tun.log";
+
+    // TUN interface requires elevated privileges
+    std::cout << tr(lang,
+        "TUN mode requires root/sudo to create the virtual network interface.\n",
+        "Режим TUN требует root/sudo для создания виртуального сетевого интерфейса.\n") << "\n";
+
+#if defined(__APPLE__) || defined(__linux__)
+    // On Unix, launch with sudo so xray can create the utun/tun device.
+    std::string launchCmd = "sudo \"" + binaryPath + "\" -config config_tun.json >" + outLogFile + " 2>&1 & echo $!";
+    std::cout << tr(lang, "Starting (may prompt for sudo password)...",
+                         "Запуск (может потребовать пароль sudo)...") << "\n";
+    FILE* pipe = popen(launchCmd.c_str(), "r");
+    if (!pipe) {
+        std::cout << tr(lang, "Failed to start xray-core.", "Не удалось запустить xray-core.") << "\n";
+        pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+        return false;
+    }
+    char pidBuf[32] = {0};
+    if (!fgets(pidBuf, sizeof(pidBuf), pipe)) {
+        pclose(pipe);
+        std::cout << tr(lang, "Failed to read xray-core PID.", "Не удалось прочитать PID xray-core.") << "\n";
+        pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+        return false;
+    }
+    pclose(pipe);
+    outPid = strtol(pidBuf, nullptr, 10);
+    if (outPid <= 0) {
+        std::cout << tr(lang, "Invalid PID — xray may not have started.", "Неверный PID — xray мог не запуститься.") << "\n";
+        pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+        return false;
+    }
+
+    // Wait a moment for xray to create the interface
+    std::cout << tr(lang, "Waiting for TUN interface to come up...", "Ожидание поднятия TUN интерфейса...") << "\n";
+    for (int i = 0; i < 5; ++i) {
+        usleep(800000);  // 0.8 s per iteration
+        // Detect created interface name from the log
+#ifdef __APPLE__
+        FILE* ifPipe = popen("ifconfig 2>/dev/null | grep -E '^utun[0-9]+:' | tail -1 | cut -d: -f1", "r");
+#else
+        FILE* ifPipe = popen("ip link 2>/dev/null | grep -oE 'tun[0-9]+' | tail -1", "r");
+#endif
+        if (ifPipe) {
+            char ifBuf[32] = {0};
+            if (fgets(ifBuf, sizeof(ifBuf), ifPipe)) {
+                ifBuf[strcspn(ifBuf, "\n ")] = '\0';
+                if (ifBuf[0] != '\0') {
+                    outIfaceName = ifBuf;
+                }
+            }
+            pclose(ifPipe);
+        }
+        if (!outIfaceName.empty()) break;
+    }
+
+    if (outIfaceName.empty()) outIfaceName = "tun?";  // fallback display label
+
+    std::cout << tr(lang, "TUN interface: ", "TUN интерфейс: ") << outIfaceName << "\n";
+    std::cout << tr(lang, "Tunnel subnet: ", "Подсеть туннеля: ") << settings.tunnelSubnet << "\n";
+    if (settings.proxyPort > 0) {
+        std::cout << tr(lang, "SOCKS5 also available on: ", "SOCKS5 также доступен на: ")
+                  << "127.0.0.1:" << settings.proxyPort << "\n";
+    }
+    if (settings.killSwitch) {
+        std::cout << tr(lang,
+            "[kill-switch ON] Traffic is blocked if tunnel drops.",
+            "[kill-switch ВКЛ] Трафик блокируется при обрыве туннеля.") << "\n";
+    }
+
+#elif defined(_WIN32)
+    // On Windows, launch with a UAC-elevated helper or just try running directly.
+    // xray on Windows may need WinTUN driver installed.
+    std::cout << tr(lang,
+        "Windows TUN: ensure WinTUN (wintun.dll) is present next to the binary.\n",
+        "Windows TUN: убедитесь, что WinTUN (wintun.dll) находится рядом с бинарником.\n");
+    std::string launchCmd = "start /B \"\" \"" + binaryPath + "\" -config config_tun.json >" + outLogFile + " 2>&1";
+    if (std::system(launchCmd.c_str()) != 0) {
+        std::cout << tr(lang, "Failed to start xray-core.", "Не удалось запустить xray-core.") << "\n";
+        pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+        return false;
+    }
+    outPid   = 0;
+    outIfaceName = settings.tunnelSubnet.empty() ? "10.8.0.0/30" : settings.tunnelSubnet;
+    // Try to find xray PID
+    FILE* pipe = _popen("tasklist /FI \"IMAGENAME eq xray.exe\" /FO CSV /NH 2>nul", "r");
+    if (pipe) {
+        char buf[256] = {0};
+        if (fgets(buf, sizeof(buf), pipe)) {
+            char* p = strchr(buf, ',');
+            if (p) {
+                ++p;
+                if (*p == '"') ++p;
+                outPid = strtol(p, nullptr, 10);
+            }
+        }
+        _pclose(pipe);
+    }
+#else
+    std::cout << tr(lang, "TUN mode is not supported on this platform.", "Режим TUN не поддерживается на этой платформе.") << "\n";
+    pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+    return false;
+#endif
+
+    std::cout << "\n" << tr(lang, "TUN tunnel active. Log: ", "TUN туннель активен. Лог: ") << outLogFile << "\n";
+    pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+    return true;
+}
+
+// ── Cleanup for TUN mode ───────────────────────────────────────────────────
+bool cleanupTunVPN(const Settings& settings) {
+    Language lang = settings.language;
+    std::cout << tr(lang, "Removing TUN interface and routing rules...",
+                         "Удаление TUN интерфейса и правил маршрутизации...") << "\n";
+#ifdef __APPLE__
+    // utun interfaces are automatically removed when xray process exits.
+    // Flush any pf rules we may have set.
+    system("sudo pfctl -F rules 2>/dev/null");
+    system("sudo pfctl -F nat  2>/dev/null");
+    system("sudo pfctl -d      2>/dev/null");
+    std::cout << tr(lang, "macOS: utun interface released.", "macOS: utun интерфейс освобождён.") << "\n";
+#elif defined(__linux__)
+    // On Linux, the tun0 interface is held by the xray process.
+    // After xray is killed, we clean up any leftover routes.
+    system("sudo ip route del default dev tun0 2>/dev/null");
+    system("sudo ip link delete tun0 2>/dev/null");
+    // Restore previous iptables state if we saved it
+    if (std::ifstream("/tmp/vl2_iptables_backup")) {
+        system("sudo iptables-restore < /tmp/vl2_iptables_backup 2>/dev/null");
+        system("rm -f /tmp/vl2_iptables_backup");
+    }
+    std::cout << tr(lang, "Linux: TUN interface released.", "Linux: TUN интерфейс освобождён.") << "\n";
+#elif defined(_WIN32)
+    // WinTUN interface is released when xray.exe exits.
+    std::cout << tr(lang, "Windows: WinTUN interface released.", "Windows: WinTUN интерфейс освобождён.") << "\n";
+#endif
     return true;
 }
 
