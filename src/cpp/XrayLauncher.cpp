@@ -371,8 +371,10 @@ std::string generateTunConfig(const Profile& profile, const Settings& settings) 
     std::ostringstream oss;
 
     std::string tunAddr = settings.tunnelSubnet.empty() ? "10.8.0.1/30" : settings.tunnelSubnet;
+    // Always name the interface "vL2" so it's easy to identify in OS network settings.
+    // If the user explicitly set a custom name (not "auto"), respect that.
     std::string tunName = (settings.tunInterface.empty() || settings.tunInterface == "auto")
-                          ? "" : settings.tunInterface;
+                          ? "vL2" : settings.tunInterface;
 
     // Log level string
     auto logLevelStr = [&]() -> std::string {
@@ -417,12 +419,9 @@ std::string generateTunConfig(const Profile& profile, const Settings& settings) 
         oss << ", \"fd6e:a81b:704f::1/126\"";
     }
     oss << "],\n"
-        << "        \"mtu\": 1450\n";
-    if (!tunName.empty()) {
-        // Note: "name" is supported in newer xray builds; ignored if not supported
-        oss << "        ,\"name\": \"" << tunName << "\"\n";
-    }
-    oss << "      },\n"
+        << "        \"mtu\": 1450,\n"
+        << "        \"name\": \"" << tunName << "\"\n"
+        << "      },\n"
         << "      \"sniffing\": {\n"
         << "        \"enabled\": true,\n"
         << "        \"destOverride\": [\"http\", \"tls\"]\n"
@@ -794,8 +793,9 @@ static std::string resolveHostname(const std::string& host) {
 
 // ── Check if we have internet connectivity through the tunnel ──────────────
 static bool testConnectivity() {
-    // Try to reach 8.8.8.8 (Google DNS) with a short timeout
-#ifdef __APPLE__
+#ifdef _WIN32
+    return system("ping -n 1 -w 3000 8.8.8.8 >nul 2>&1") == 0;
+#elif defined(__APPLE__)
     return system("ping -c 1 -t 3 8.8.8.8 >/dev/null 2>&1") == 0;
 #else
     return system("ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1") == 0;
@@ -967,6 +967,138 @@ static bool setupTunRoutes(const std::string& ifaceName,
     }
     std::cout << "OK\n";
     return true;
+#elif defined(_WIN32)
+    // ── Windows: PowerShell Add-NetRoute ─────────────────────────────────────
+    // Interface name is always "vL2" (set in the xray config).
+    const std::string iface = "vL2";
+
+    // 1. Resolve VPN server hostname → IP (route add needs IP)
+    std::string vpnIp;
+    if (!vpnServerHost.empty() && vpnServerHost != "invalid") {
+        std::cout << "  Resolving " << vpnServerHost << "... ";
+        std::cout.flush();
+        // nslookup outputs "Address: x.x.x.x" for the answer
+        std::string nsCmd = "nslookup " + vpnServerHost + " 8.8.8.8 2>nul";
+        FILE* nsp = _popen(nsCmd.c_str(), "r");
+        if (nsp) {
+            char buf[256] = {0};
+            bool skip = true;   // skip the server/address lines for 8.8.8.8 itself
+            while (fgets(buf, sizeof(buf), nsp)) {
+                std::string line(buf);
+                if (line.find("Name:") != std::string::npos) { skip = false; continue; }
+                if (!skip && line.find("Address:") != std::string::npos) {
+                    size_t p = line.find(':');
+                    if (p != std::string::npos) {
+                        vpnIp = line.substr(p + 2);
+                        vpnIp.erase(vpnIp.find_last_not_of(" \t\r\n") + 1);
+                    }
+                    break;
+                }
+            }
+            _pclose(nsp);
+        }
+        std::cout << (vpnIp.empty() ? "failed" : vpnIp) << "\n";
+    }
+
+    // 2. Get current default gateway and interface
+    char gwBuf[64] = {0};
+    char ifIdxBuf[16] = {0};
+    {
+        FILE* p = _popen("powershell -Command \"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop\" 2>nul", "r");
+        if (p) { fgets(gwBuf, sizeof(gwBuf), p); _pclose(p); }
+        gwBuf[strcspn(gwBuf, "\r\n")] = '\0';
+    }
+    {
+        FILE* p = _popen("powershell -Command \"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).ifIndex\" 2>nul", "r");
+        if (p) { fgets(ifIdxBuf, sizeof(ifIdxBuf), p); _pclose(p); }
+        ifIdxBuf[strcspn(ifIdxBuf, "\r\n")] = '\0';
+    }
+
+    if (!gwBuf[0]) {
+        std::cout << "  ERROR: cannot detect default gateway\n";
+        return false;
+    }
+    std::cout << "  gateway=" << gwBuf << "  ifIndex=" << ifIdxBuf << "\n";
+
+    // Persist for cleanup
+    { std::ofstream f("C:\\vl2_tun_gw.txt");     f << gwBuf; }
+    { std::ofstream f("C:\\vl2_tun_ifidx.txt");  f << ifIdxBuf; }
+    { std::ofstream f("C:\\vl2_tun_server.txt"); f << vpnIp; }
+
+    // 3. Bypass route: VPN server → real gateway (must add BEFORE default route changes)
+    if (!vpnIp.empty() && gwBuf[0]) {
+        std::string cmd = "route add " + vpnIp + " " + std::string(gwBuf) + " metric 1 >nul 2>&1";
+        system(cmd.c_str());
+    } else {
+        std::cout << "  WARNING: VPN server IP unknown — may loop!\n";
+    }
+
+    // 4. Wait for vL2 interface to appear
+    std::cout << "  Waiting for vL2 interface... ";
+    std::cout.flush();
+    bool ifaceFound = false;
+    for (int i = 0; i < 8; ++i) {
+        Sleep(500);
+        FILE* chk = _popen("powershell -Command \"if (Get-NetAdapter -Name 'vL2' -ErrorAction SilentlyContinue) { 'found' }\" 2>nul", "r");
+        if (chk) {
+            char cb[16] = {0};
+            fgets(cb, sizeof(cb), chk);
+            _pclose(chk);
+            if (strstr(cb, "found")) { ifaceFound = true; break; }
+        }
+    }
+    std::cout << (ifaceFound ? "OK\n" : "not found (continuing anyway)\n");
+
+    // 5. Set interface description to "vL2 tun" via PowerShell
+    system("powershell -Command \"try { Set-NetAdapter -Name 'vL2' -Description 'vL2 tun' -Confirm:$false -ErrorAction Stop } catch {}\" >nul 2>&1");
+
+    // 6. Route all traffic through vL2 (two /1 cover all of /0)
+    system("powershell -Command \"Remove-NetRoute -DestinationPrefix '0.0.0.0/1'   -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+    system("powershell -Command \"Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+    system("powershell -Command \"New-NetRoute -DestinationPrefix '0.0.0.0/1'   -InterfaceAlias 'vL2' -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore\" >nul 2>&1");
+    system("powershell -Command \"New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias 'vL2' -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore\" >nul 2>&1");
+
+    // 7. Set DNS on vL2 interface
+    {
+        std::string dnsArgs;
+        std::istringstream d(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
+        std::string s;
+        bool first = true;
+        while (std::getline(d, s, ',')) {
+            if (s.empty()) continue;
+            if (first) {
+                system(("netsh interface ip set dns name=\"vL2\" static " + s + " primary >nul 2>&1").c_str());
+                first = false;
+            } else {
+                system(("netsh interface ip add dns name=\"vL2\" " + s + " index=2 >nul 2>&1").c_str());
+            }
+        }
+        // Also set DNS on all other adapters to avoid leaks
+        system(("powershell -Command \"Get-NetAdapter | Where-Object {$_.Name -ne 'vL2' -and $_.Status -eq 'Up'} | ForEach-Object { Set-DnsClientServerAddress -InterfaceAlias $_.Name -ServerAddresses '" + (settings.dnsServers.empty() ? "8.8.8.8" : settings.dnsServers.substr(0, settings.dnsServers.find(','))) + "' }\" >nul 2>&1").c_str());
+    }
+
+    // 8. Flush DNS cache
+    system("ipconfig /flushdns >nul 2>&1");
+
+    // 9. Connectivity test
+    std::cout << "  Testing connectivity... ";
+    std::cout.flush();
+    Sleep(2000);
+    if (!testConnectivity()) {
+        std::cout << "FAIL — rolling back!\n";
+        system("powershell -Command \"Remove-NetRoute -DestinationPrefix '0.0.0.0/1'   -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+        system("powershell -Command \"Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+        if (!vpnIp.empty()) {
+            system(("route delete " + vpnIp + " >nul 2>&1").c_str());
+        }
+        system("powershell -Command \"Get-NetAdapter | ForEach-Object { Set-DnsClientServerAddress -InterfaceAlias $_.Name -ResetServerAddresses }\" >nul 2>&1");
+        system("ipconfig /flushdns >nul 2>&1");
+        system("del /f C:\\vl2_tun_gw.txt C:\\vl2_tun_ifidx.txt C:\\vl2_tun_server.txt >nul 2>&1");
+        return false;
+    }
+    std::cout << "OK\n";
+    return true;
+
 #else
     (void)ifaceName; (void)vpnServerHost; (void)settings;
     return false;
@@ -1013,6 +1145,23 @@ static void cleanupTunRoutes(const std::string& ifaceName) {
     }
     system("sudo cp /tmp/vl2_resolv_backup /etc/resolv.conf 2>/dev/null");
     system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server /tmp/vl2_resolv_backup /tmp/vl2_resolv_new");
+
+#elif defined(_WIN32)
+    (void)ifaceName;
+    std::string vpnIp;
+    { std::ifstream f("C:\\vl2_tun_server.txt"); f >> vpnIp; }
+
+    // Remove the two /1 routes
+    system("powershell -Command \"Remove-NetRoute -DestinationPrefix '0.0.0.0/1'   -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+    system("powershell -Command \"Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+    // Remove bypass route for VPN server
+    if (!vpnIp.empty()) {
+        system(("route delete " + vpnIp + " >nul 2>&1").c_str());
+    }
+    // Restore DNS to DHCP on all adapters
+    system("powershell -Command \"Get-NetAdapter | ForEach-Object { Set-DnsClientServerAddress -InterfaceAlias $_.Name -ResetServerAddresses }\" >nul 2>&1");
+    system("ipconfig /flushdns >nul 2>&1");
+    system("del /f C:\\vl2_tun_gw.txt C:\\vl2_tun_ifidx.txt C:\\vl2_tun_server.txt >nul 2>&1");
 #endif
 }
 
@@ -1137,32 +1286,117 @@ bool launchXrayTun(const Settings& settings, const Profile& profile,
     }
 
 #elif defined(_WIN32)
-    // On Windows, launch with a UAC-elevated helper or just try running directly.
-    // xray on Windows may need WinTUN driver installed.
+    // Windows: requires WinTUN driver (wintun.dll next to the binary).
+    // xray must run as Administrator to create TUN interface.
     std::cout << tr(lang,
-        "Windows TUN: ensure WinTUN (wintun.dll) is present next to the binary.\n",
-        "Windows TUN: убедитесь, что WinTUN (wintun.dll) находится рядом с бинарником.\n");
-    std::string launchCmd = "start /B \"\" \"" + binaryPath + "\" -config config_tun.json >" + outLogFile + " 2>&1";
+        "Windows TUN: requires Administrator + wintun.dll next to xray binary.",
+        "Windows TUN: требует прав Администратора + wintun.dll рядом с бинарником.") << "\n";
+
+    // ── Auto-download wintun.dll if missing ───────────────────────────────
+    {
+        // wintun.dll must sit next to the xray binary
+        fs::path xrayDir = fs::path(binaryPath).parent_path();
+        fs::path wintunPath = xrayDir / "wintun.dll";
+        if (!fs::exists(wintunPath)) {
+            std::cout << tr(lang,
+                "wintun.dll not found — downloading from wintun.net...",
+                "wintun.dll не найден — скачиваю с wintun.net...") << "\n";
+
+            std::string tmpZip = std::string(std::getenv("TEMP") ? std::getenv("TEMP") : "C:\\Temp")
+                                 + "\\wintun.zip";
+            // Official wintun release from wintun.net (Cloudflare-signed)
+            std::string dlCmd = "powershell -Command \""
+                "Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip'"
+                " -OutFile '" + tmpZip + "' -UseBasicParsing\" >nul 2>&1";
+            int dlRet = system(dlCmd.c_str());
+            if (dlRet == 0 && fs::exists(tmpZip)) {
+                // Extract wintun.dll for the correct architecture
+                // The zip contains: wintun/bin/amd64/wintun.dll, arm64/wintun.dll, x86/wintun.dll
+#ifdef _M_ARM64
+                std::string arch = "arm64";
+#elif defined(_M_IX86)
+                std::string arch = "x86";
+#else
+                std::string arch = "amd64";
+#endif
+                std::string extractCmd = "powershell -Command \""
+                    "$z = [System.IO.Compression.ZipFile]::OpenRead('" + tmpZip + "');"
+                    "$e = $z.Entries | Where-Object { $_.FullName -like '*/" + arch + "/wintun.dll' };"
+                    "if ($e) { [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, '"
+                    + wintunPath.string() + "', $true) };"
+                    "$z.Dispose()\" >nul 2>&1";
+                system(extractCmd.c_str());
+                system(("del /f \"" + tmpZip + "\" >nul 2>&1").c_str());
+
+                if (fs::exists(wintunPath)) {
+                    std::cout << tr(lang, "wintun.dll downloaded OK.", "wintun.dll успешно скачан.") << "\n";
+                } else {
+                    std::cout << tr(lang,
+                        "wintun.dll download failed. Download manually from https://www.wintun.net\n"
+                        "and place wintun.dll next to the xray binary, then retry.",
+                        "Не удалось скачать wintun.dll. Скачайте вручную с https://www.wintun.net\n"
+                        "и поместите wintun.dll рядом с бинарником xray, затем повторите.") << "\n";
+                    pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+                    return false;
+                }
+            } else {
+                std::cout << tr(lang,
+                    "Cannot download wintun.dll (no internet or PowerShell unavailable).\n"
+                    "Get it from https://www.wintun.net — place wintun.dll next to xray binary.",
+                    "Не удалось скачать wintun.dll (нет интернета или PowerShell недоступен).\n"
+                    "Скачайте с https://www.wintun.net — поместите wintun.dll рядом с бинарником xray.") << "\n";
+                pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+                return false;
+            }
+        } else {
+            std::cout << tr(lang, "wintun.dll found.", "wintun.dll найден.") << "\n";
+        }
+    }
+
+    // Launch xray as a detached process (it will create "vL2" adapter via WinTUN)
+    std::string launchCmd = "start /B \"vL2 tunnel\" \"" + binaryPath + "\" -config config_tun.json >" + outLogFile + " 2>&1";
     if (std::system(launchCmd.c_str()) != 0) {
         std::cout << tr(lang, "Failed to start xray-core.", "Не удалось запустить xray-core.") << "\n";
         pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
         return false;
     }
-    outPid   = 0;
-    outIfaceName = settings.tunnelSubnet.empty() ? "10.8.0.0/30" : settings.tunnelSubnet;
-    // Try to find xray PID
-    FILE* pipe = _popen("tasklist /FI \"IMAGENAME eq xray.exe\" /FO CSV /NH 2>nul", "r");
-    if (pipe) {
-        char buf[256] = {0};
-        if (fgets(buf, sizeof(buf), pipe)) {
-            char* p = strchr(buf, ',');
-            if (p) {
-                ++p;
-                if (*p == '"') ++p;
-                outPid = strtol(p, nullptr, 10);
-            }
+
+    // Get PID
+    outPid = 0;
+    {
+        FILE* pl = _popen("powershell -Command \"(Get-Process -Name xray -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -Last 1).Id\" 2>nul", "r");
+        if (pl) {
+            char buf[32] = {0};
+            fgets(buf, sizeof(buf), pl);
+            _pclose(pl);
+            outPid = strtol(buf, nullptr, 10);
         }
-        _pclose(pipe);
+    }
+
+    // Interface name is always "vL2"
+    outIfaceName = "vL2";
+
+    std::cout << tr(lang,
+        "Waiting for vL2 interface to come up...",
+        "Ожидание появления интерфейса vL2...") << "\n";
+
+    // ── Set up routing ─────────────────────────────────────────────────────
+    std::cout << tr(lang,
+        "Setting up routing rules (hostname will be resolved to IP)...",
+        "Настройка маршрутов (хостнейм будет разрешён в IP)...") << "\n";
+    bool routesOk = setupTunRoutes(outIfaceName, profileServerHost(profile), settings);
+    if (!routesOk) {
+        std::cout << "\n" << tr(lang,
+            "Route setup failed — routes rolled back.\n"
+            "xray is still running as SOCKS5 proxy on 127.0.0.1:",
+            "Маршруты не применены — откат выполнен.\n"
+            "xray работает как SOCKS5 прокси на 127.0.0.1:")
+            << settings.proxyPort << "\n";
+        std::cout << tr(lang, "Check xray-tun.log for details.", "Смотрите xray-tun.log для деталей.") << "\n";
+        // Print last 20 lines of log
+        system(("powershell -Command \"Get-Content '" + outLogFile + "' -Tail 20\" 2>nul").c_str());
+    } else {
+        std::cout << tr(lang, "Routes configured. Tunnel is active.", "Маршруты настроены. Туннель активен.") << "\n";
     }
 #else
     std::cout << tr(lang, "TUN mode is not supported on this platform.", "Режим TUN не поддерживается на этой платформе.") << "\n";

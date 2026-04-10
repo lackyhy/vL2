@@ -24,7 +24,7 @@ int readKey() {
         }
     }
     return ch;
-#else
+#else   
     struct termios oldt, newt;
     tcgetattr(STDIN_FILENO, &oldt);
     newt = oldt;
