@@ -32,4 +32,18 @@ bool cleanupSystemVPN(const Settings& settings);
 bool cleanupTunVPN(const Settings& settings);
 bool downloadXrayCore(const Settings& settings);
 
+// ── Per-app proxy ──────────────────────────────────────────────────────────
+// Launch a command with SOCKS5/HTTP proxy environment variables injected,
+// and optionally via proxychains-ng if available on the system.
+// proxyPort: SOCKS5 port; httpProxyPort: HTTP proxy port (0 = disabled).
+void launchAppThroughProxy(const std::string& command, int proxyPort,
+                           int httpProxyPort, Language lang);
+
+// Check whether proxychains-ng (proxychains4 / proxychains) is installed.
+bool isProxychainsAvailable();
+
+// Write a minimal proxychains config pointing to the local SOCKS5 proxy.
+// Returns the path to the generated config file.
+std::string writeProxychainsConfig(int proxyPort);
+
 #endif // VL2_XRAY_LAUNCHER_H

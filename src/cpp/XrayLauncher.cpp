@@ -367,14 +367,40 @@ static void appendOutbound(std::ostringstream& oss, const Profile& profile) {
 // NOTE: xray tun does NOT support autoRoute/strictRoute (those are sing-box
 // fields). Routing must be set up by the host OS after xray starts —
 // see setupTunRoutes() below.
+// ── Pick a TUN interface name suitable for the current OS ─────────────────
+// macOS: xray requires the format "utunN" (a number suffix), e.g. utun5.
+//        We auto-detect the highest existing utunN and use N+1.
+// Linux: any name works; "tun0" is conventional but we fall back to "vl2tun"
+//        if the user did not specify one.
+static std::string pickTunName(const std::string& userPref) {
+    if (!userPref.empty() && userPref != "auto") return userPref;
+
+#ifdef __APPLE__
+    // List existing utun interfaces and pick the next free number.
+    int maxN = -1;
+    FILE* p = popen("ifconfig 2>/dev/null | grep -oE '^utun[0-9]+' | sed 's/utun//'", "r");
+    if (p) {
+        char buf[16] = {0};
+        while (fgets(buf, sizeof(buf), p)) {
+            buf[strcspn(buf, "\n ")] = '\0';
+            if (buf[0]) {
+                int n = atoi(buf);
+                if (n > maxN) maxN = n;
+            }
+        }
+        pclose(p);
+    }
+    return "utun" + std::to_string(maxN + 1);
+#else
+    return "tun0";
+#endif
+}
+
 std::string generateTunConfig(const Profile& profile, const Settings& settings) {
     std::ostringstream oss;
 
     std::string tunAddr = settings.tunnelSubnet.empty() ? "10.8.0.1/30" : settings.tunnelSubnet;
-    // Always name the interface "vL2" so it's easy to identify in OS network settings.
-    // If the user explicitly set a custom name (not "auto"), respect that.
-    std::string tunName = (settings.tunInterface.empty() || settings.tunInterface == "auto")
-                          ? "vL2" : settings.tunInterface;
+    std::string tunName = pickTunName(settings.tunInterface);
 
     // Log level string
     auto logLevelStr = [&]() -> std::string {
@@ -941,16 +967,36 @@ static bool setupTunRoutes(const std::string& ifaceName,
     system(("sudo ip route add 0.0.0.0/1   dev " + ifaceName + " 2>/dev/null").c_str());
     system(("sudo ip route add 128.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
 
-    system("sudo cp /etc/resolv.conf /tmp/vl2_resolv_backup 2>/dev/null");
-    {
-        std::ofstream rc("/tmp/vl2_resolv_new");
+    // ── DNS: prefer systemd-resolved (Arch Linux), fallback to /etc/resolv.conf ──
+    // Detect whether resolvectl is available (systemd-resolved).
+    bool useResolvectl = (system("command -v resolvectl >/dev/null 2>&1") == 0);
+    { std::ofstream f("/tmp/vl2_tun_use_resolvectl"); f << (useResolvectl ? "1" : "0"); }
+
+    if (useResolvectl) {
+        // Apply DNS via resolvectl — works on Arch, Ubuntu 20+, etc.
         std::istringstream d(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
         std::string s;
+        std::string dnsArgs;
         while (std::getline(d, s, ',')) {
-            if (!s.empty()) rc << "nameserver " << s << "\n";
+            if (!s.empty()) dnsArgs += " " + s;
         }
+        system(("sudo resolvectl dns " + ifaceName + dnsArgs + " 2>/dev/null").c_str());
+        system(("sudo resolvectl domain " + ifaceName + " ~. 2>/dev/null").c_str());
+        // Tell systemd-resolved this link is the default DNS for all domains
+        system("sudo resolvectl default-route " + ifaceName + " yes 2>/dev/null");
+    } else {
+        // Fallback: edit /etc/resolv.conf directly
+        system("sudo cp /etc/resolv.conf /tmp/vl2_resolv_backup 2>/dev/null");
+        {
+            std::ofstream rc("/tmp/vl2_resolv_new");
+            std::istringstream d(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
+            std::string s;
+            while (std::getline(d, s, ',')) {
+                if (!s.empty()) rc << "nameserver " << s << "\n";
+            }
+        }
+        system("sudo cp /tmp/vl2_resolv_new /etc/resolv.conf 2>/dev/null");
     }
-    system("sudo cp /tmp/vl2_resolv_new /etc/resolv.conf 2>/dev/null");
 
     std::cout << "  Testing connectivity... ";
     std::cout.flush();
@@ -961,8 +1007,12 @@ static bool setupTunRoutes(const std::string& ifaceName,
         system(("sudo ip route del 128.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
         if (!vpnIp.empty())
             system(("sudo ip route del " + vpnIp + " 2>/dev/null").c_str());
-        system("sudo cp /tmp/vl2_resolv_backup /etc/resolv.conf 2>/dev/null");
-        system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server");
+        if (useResolvectl) {
+            system(("sudo resolvectl revert " + ifaceName + " 2>/dev/null").c_str());
+        } else {
+            system("sudo cp /tmp/vl2_resolv_backup /etc/resolv.conf 2>/dev/null");
+        }
+        system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server /tmp/vl2_tun_use_resolvectl");
         return false;
     }
     std::cout << "OK\n";
@@ -1143,8 +1193,16 @@ static void cleanupTunRoutes(const std::string& ifaceName) {
     if (!vpnServer.empty()) {
         system(("sudo ip route del " + vpnServer + " 2>/dev/null").c_str());
     }
-    system("sudo cp /tmp/vl2_resolv_backup /etc/resolv.conf 2>/dev/null");
-    system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server /tmp/vl2_resolv_backup /tmp/vl2_resolv_new");
+
+    // Restore DNS: prefer resolvectl if it was used during setup
+    std::string useRc;
+    { std::ifstream f("/tmp/vl2_tun_use_resolvectl"); f >> useRc; }
+    if (useRc == "1") {
+        system(("sudo resolvectl revert " + ifaceName + " 2>/dev/null").c_str());
+    } else {
+        system("sudo cp /tmp/vl2_resolv_backup /etc/resolv.conf 2>/dev/null");
+    }
+    system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server /tmp/vl2_resolv_backup /tmp/vl2_resolv_new /tmp/vl2_tun_use_resolvectl");
 
 #elif defined(_WIN32)
     (void)ifaceName;
@@ -1181,8 +1239,15 @@ bool launchXrayTun(const Settings& settings, const Profile& profile,
     }
     std::cout << tr(lang, "Binary: ", "Бинарник: ") << binaryPath << "\n";
 
+    // Resolve TUN interface name BEFORE generating config so we know what to wait for.
+    // pickTunName() auto-detects the next free utunN on macOS, tun0 on Linux.
+    // We store it into a local copy of settings so generateTunConfig uses the same name.
+    Settings settingsForTun = settings;
+    settingsForTun.tunInterface = pickTunName(settings.tunInterface);
+    std::cout << tr(lang, "TUN interface will be: ", "Имя TUN интерфейса: ") << settingsForTun.tunInterface << "\n";
+
     // Generate TUN config
-    std::string config = generateTunConfig(profile, settings);
+    std::string config = generateTunConfig(profile, settingsForTun);
     std::ofstream configFile("config_tun.json");
     if (!configFile) {
         std::cout << tr(lang, "Failed to create config_tun.json", "Не удалось создать config_tun.json") << "\n";
@@ -1225,40 +1290,38 @@ bool launchXrayTun(const Settings& settings, const Profile& profile,
         return false;
     }
 
-    // Wait a moment for xray to create the interface
+    // Wait for xray to bring up the interface we expect.
+    const std::string& expectedIface = settingsForTun.tunInterface;
     std::cout << tr(lang, "Waiting for TUN interface to come up...", "Ожидание поднятия TUN интерфейса...") << "\n";
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 8; ++i) {
         usleep(800000);  // 0.8 s per iteration
-        // Detect created interface name from the log
 #ifdef __APPLE__
-        FILE* ifPipe = popen("ifconfig 2>/dev/null | grep -E '^utun[0-9]+:' | tail -1 | cut -d: -f1", "r");
+        std::string checkCmd = "ifconfig " + expectedIface + " >/dev/null 2>&1";
 #else
-        FILE* ifPipe = popen("ip link 2>/dev/null | grep -oE 'tun[0-9]+' | tail -1", "r");
+        std::string checkCmd = "ip link show " + expectedIface + " >/dev/null 2>&1";
 #endif
-        if (ifPipe) {
-            char ifBuf[32] = {0};
-            if (fgets(ifBuf, sizeof(ifBuf), ifPipe)) {
-                ifBuf[strcspn(ifBuf, "\n ")] = '\0';
-                if (ifBuf[0] != '\0') {
-                    outIfaceName = ifBuf;
-                }
-            }
-            pclose(ifPipe);
+        if (system(checkCmd.c_str()) == 0) {
+            outIfaceName = expectedIface;
+            break;
         }
-        if (!outIfaceName.empty()) break;
     }
 
-    if (outIfaceName.empty()) outIfaceName = "tun?";  // fallback display label
+    if (outIfaceName.empty()) {
+        outIfaceName = expectedIface;  // use expected name anyway, routes may still work
+        std::cout << tr(lang,
+            "WARNING: interface not detected yet, continuing...",
+            "ПРЕДУПРЕЖДЕНИЕ: интерфейс ещё не обнаружен, продолжаем...") << "\n";
+    }
 
     std::cout << tr(lang, "TUN interface: ", "TUN интерфейс: ") << outIfaceName << "\n";
-    std::cout << tr(lang, "Tunnel subnet: ", "Подсеть туннеля: ") << settings.tunnelSubnet << "\n";
+    std::cout << tr(lang, "Tunnel subnet: ", "Подсеть туннеля: ") << settingsForTun.tunnelSubnet << "\n";
 
     // ── Set up OS routing rules ────────────────────────────────────────────
     std::cout << tr(lang,
         "Setting up routing rules (hostname will be resolved to IP)...",
         "Настройка маршрутов (хостнейм будет разрешён в IP)...") << "\n";
     std::string vpnServer = profileServerHost(profile);
-    bool routesOk = setupTunRoutes(outIfaceName, vpnServer, settings);
+    bool routesOk = setupTunRoutes(outIfaceName, vpnServer, settingsForTun);
     if (!routesOk) {
         std::cout << "\n" << tr(lang,
             "Route setup failed or connectivity test failed — routes rolled back.\n"
@@ -1788,4 +1851,95 @@ bool downloadXrayCore(const Settings& settings) {
         "Xray-core binary not found after extraction. Check the xray/ folder manually.",
         "Бинарник xray-core не найден после распаковки. Проверьте папку xray/ вручную.") << "\n";
     return false;
+}
+
+// ── Per-app proxy helpers ──────────────────────────────────────────────────
+
+bool isProxychainsAvailable() {
+#if defined(__unix__) || defined(__APPLE__)
+    return system("command -v proxychains4 >/dev/null 2>&1") == 0
+        || system("command -v proxychains  >/dev/null 2>&1") == 0;
+#else
+    return false;
+#endif
+}
+
+std::string writeProxychainsConfig(int proxyPort) {
+    const std::string cfgPath = "/tmp/vl2_proxychains.conf";
+    std::ofstream cfg(cfgPath);
+    cfg << "strict_chain\n"
+        << "proxy_dns\n"
+        << "tcp_read_time_out 15000\n"
+        << "tcp_connect_time_out 8000\n"
+        << "[ProxyList]\n"
+        << "socks5 127.0.0.1 " << proxyPort << "\n";
+    return cfgPath;
+}
+
+void launchAppThroughProxy(const std::string& command, int proxyPort,
+                           int httpProxyPort, Language lang) {
+#if defined(__unix__) || defined(__APPLE__)
+    clearScreen();
+    std::cout << "=== " << tr(lang, "Launch app through proxy", "Запуск приложения через прокси") << " ===\n\n";
+    std::cout << tr(lang, "Command: ", "Команда: ") << command << "\n";
+    std::cout << tr(lang, "SOCKS5 proxy: 127.0.0.1:", "SOCKS5 прокси: 127.0.0.1:") << proxyPort << "\n\n";
+
+    std::string launchCmd;
+
+    if (isProxychainsAvailable()) {
+        // proxychains forces ALL TCP connections through the proxy,
+        // even for apps that don't honour env-vars (e.g. curl without -x, etc.)
+        std::string cfgPath = writeProxychainsConfig(proxyPort);
+
+        // Detect which binary is available
+        bool has4 = (system("command -v proxychains4 >/dev/null 2>&1") == 0);
+        std::string pchains = has4 ? "proxychains4" : "proxychains";
+
+        launchCmd = pchains + " -f " + cfgPath + " " + command
+                    + " >/dev/null 2>&1 &";
+
+        std::cout << tr(lang, "Using proxychains — all TCP traffic from this app goes through the proxy.",
+                              "Используется proxychains — весь TCP трафик приложения идёт через прокси.") << "\n";
+    } else {
+        // Fallback: inject proxy env-vars.  Works for curl, wget, git, pip,
+        // npm, most GUI apps, etc.  Does NOT intercept hard-coded TCP.
+        std::string socksUrl  = "socks5://127.0.0.1:" + std::to_string(proxyPort);
+        std::string httpUrl   = httpProxyPort > 0
+            ? ("http://127.0.0.1:" + std::to_string(httpProxyPort))
+            : ("http://127.0.0.1:" + std::to_string(proxyPort));
+
+        launchCmd = "env "
+            "ALL_PROXY="   + socksUrl  + " "
+            "all_proxy="   + socksUrl  + " "
+            "HTTP_PROXY="  + httpUrl   + " "
+            "http_proxy="  + httpUrl   + " "
+            "HTTPS_PROXY=" + httpUrl   + " "
+            "https_proxy=" + httpUrl   + " "
+            + command + " >/dev/null 2>&1 &";
+
+        std::cout << tr(lang,
+            "proxychains not found — using proxy environment variables.\n"
+            "Install proxychains-ng for better coverage (pacman -S proxychains-ng).",
+            "proxychains не найден — используются переменные окружения прокси.\n"
+            "Установите proxychains-ng для лучшего покрытия (pacman -S proxychains-ng).") << "\n";
+    }
+
+    std::cout << "\n" << tr(lang, "Launching...", "Запуск...") << "\n";
+    int ret = system(launchCmd.c_str());
+    if (ret == 0) {
+        std::cout << tr(lang, "App launched in background.", "Приложение запущено в фоне.") << "\n";
+    } else {
+        std::cout << tr(lang, "Warning: launch command returned non-zero.", "Предупреждение: команда вернула ненулевой код.") << "\n";
+    }
+    pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+#else
+    (void)command; (void)proxyPort; (void)httpProxyPort;
+    clearScreen();
+    std::cout << tr(lang,
+        "Per-app proxy via env-vars is not supported on Windows in this build.\n"
+        "Use system proxy settings or a tool like Proxifier.",
+        "Прокси для отдельных приложений через env-vars не поддерживается в Windows в этой сборке.\n"
+        "Используйте системные настройки прокси или программу Proxifier.") << "\n";
+    pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+#endif
 }

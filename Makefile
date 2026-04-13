@@ -201,6 +201,30 @@ src/cpp/Settings.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/vl2.dir/build.make CMakeFiles/vl2.dir/src/cpp/Settings.cpp.s
 .PHONY : src/cpp/Settings.cpp.s
 
+src/cpp/TrayIcon.o: src/cpp/TrayIcon.cpp.o
+.PHONY : src/cpp/TrayIcon.o
+
+# target to build an object file
+src/cpp/TrayIcon.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vl2.dir/build.make CMakeFiles/vl2.dir/src/cpp/TrayIcon.cpp.o
+.PHONY : src/cpp/TrayIcon.cpp.o
+
+src/cpp/TrayIcon.i: src/cpp/TrayIcon.cpp.i
+.PHONY : src/cpp/TrayIcon.i
+
+# target to preprocess a source file
+src/cpp/TrayIcon.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vl2.dir/build.make CMakeFiles/vl2.dir/src/cpp/TrayIcon.cpp.i
+.PHONY : src/cpp/TrayIcon.cpp.i
+
+src/cpp/TrayIcon.s: src/cpp/TrayIcon.cpp.s
+.PHONY : src/cpp/TrayIcon.s
+
+# target to generate assembly for a file
+src/cpp/TrayIcon.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vl2.dir/build.make CMakeFiles/vl2.dir/src/cpp/TrayIcon.cpp.s
+.PHONY : src/cpp/TrayIcon.cpp.s
+
 src/cpp/XrayLauncher.o: src/cpp/XrayLauncher.cpp.o
 .PHONY : src/cpp/XrayLauncher.o
 
@@ -249,6 +273,30 @@ src/cpp/main.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/vl2.dir/build.make CMakeFiles/vl2.dir/src/cpp/main.cpp.s
 .PHONY : src/cpp/main.cpp.s
 
+src/cpp/xray_embedded_stub.o: src/cpp/xray_embedded_stub.cpp.o
+.PHONY : src/cpp/xray_embedded_stub.o
+
+# target to build an object file
+src/cpp/xray_embedded_stub.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vl2.dir/build.make CMakeFiles/vl2.dir/src/cpp/xray_embedded_stub.cpp.o
+.PHONY : src/cpp/xray_embedded_stub.cpp.o
+
+src/cpp/xray_embedded_stub.i: src/cpp/xray_embedded_stub.cpp.i
+.PHONY : src/cpp/xray_embedded_stub.i
+
+# target to preprocess a source file
+src/cpp/xray_embedded_stub.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vl2.dir/build.make CMakeFiles/vl2.dir/src/cpp/xray_embedded_stub.cpp.i
+.PHONY : src/cpp/xray_embedded_stub.cpp.i
+
+src/cpp/xray_embedded_stub.s: src/cpp/xray_embedded_stub.cpp.s
+.PHONY : src/cpp/xray_embedded_stub.s
+
+# target to generate assembly for a file
+src/cpp/xray_embedded_stub.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/vl2.dir/build.make CMakeFiles/vl2.dir/src/cpp/xray_embedded_stub.cpp.s
+.PHONY : src/cpp/xray_embedded_stub.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -267,12 +315,18 @@ help:
 	@echo "... src/cpp/Settings.o"
 	@echo "... src/cpp/Settings.i"
 	@echo "... src/cpp/Settings.s"
+	@echo "... src/cpp/TrayIcon.o"
+	@echo "... src/cpp/TrayIcon.i"
+	@echo "... src/cpp/TrayIcon.s"
 	@echo "... src/cpp/XrayLauncher.o"
 	@echo "... src/cpp/XrayLauncher.i"
 	@echo "... src/cpp/XrayLauncher.s"
 	@echo "... src/cpp/main.o"
 	@echo "... src/cpp/main.i"
 	@echo "... src/cpp/main.s"
+	@echo "... src/cpp/xray_embedded_stub.o"
+	@echo "... src/cpp/xray_embedded_stub.i"
+	@echo "... src/cpp/xray_embedded_stub.s"
 .PHONY : help
 
 

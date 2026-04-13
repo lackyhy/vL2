@@ -26,6 +26,7 @@ int main() {
     signal(SIGINT, SIG_IGN);
     loadSettings(settings);
     loadProfiles(profiles);
+    loadAppList(settings);
 
     // Check if xray-core binary exists, offer to download if not
     std::string xrayBinaryPath = findXrayCoreBinary(settings);
@@ -124,6 +125,7 @@ int main() {
         std::vector<std::string> menuItems = {
             tr(settings.language, "Launch xray-core (proxy)", "Запустить xray-core (прокси)"),
             tr(settings.language, "Launch TUN tunnel (virtual interface)", "Запустить TUN туннель (виртуальный интерфейс)"),
+            tr(settings.language, "Per-app proxy (route specific apps)", "Прокси для приложений (выбрать приложения)"),
             tr(settings.language, "Profiles", "Профили"),
             tr(settings.language, "Settings", "Настройки")
         };
@@ -203,6 +205,7 @@ int main() {
             std::string selectedItem = menuItems[selected];
             std::string launchStr    = tr(settings.language, "Launch xray-core (proxy)", "Запустить xray-core (прокси)");
             std::string tunLaunchStr = tr(settings.language, "Launch TUN tunnel (virtual interface)", "Запустить TUN туннель (виртуальный интерфейс)");
+            std::string perAppStr    = tr(settings.language, "Per-app proxy (route specific apps)", "Прокси для приложений (выбрать приложения)");
             std::string profilesStr  = tr(settings.language, "Profiles", "Профили");
             std::string settingsStr  = tr(settings.language, "Settings", "Настройки");
             std::string statusStr    = tr(settings.language, "Show xray-core status", "Показать статус xray-core");
@@ -271,6 +274,12 @@ int main() {
                         }
                     }
                 }
+            } else if (selectedItem == perAppStr) {
+                // ── Per-app proxy manager ──────────────────────────────────
+                int activePort     = xrayRunning ? settings.proxyPort     : 0;
+                int activeHttpPort = xrayRunning ? settings.httpProxyPort : 0;
+                editAppProxyList(settings, activePort, activeHttpPort);
+                saveAppList(settings);
             } else if (selectedItem == profilesStr) {
                 editProfiles(profiles, settings.language);
                 saveProfiles(profiles);
