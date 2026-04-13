@@ -3,6 +3,7 @@
 
 #include <vector>
 #include <string>
+#include <functional>
 #include "Settings.h"
 
 void showProfiles(const std::vector<Profile>& profiles, Language lang);
@@ -18,7 +19,12 @@ void saveAppList(const Settings& settings);
 void loadAppList(Settings& settings);
 
 // Per-app proxy manager UI.
-// proxyPort/httpProxyPort: currently active ports (0 if xray not running).
-void editAppProxyList(Settings& settings, int proxyPort, int httpProxyPort);
+// startProxy: lambda called when proxy needs to start — must start xray and
+//             update proxyPort/httpProxyPort, return true on success.
+// proxyPort / httpProxyPort: in-out, updated if proxy is started inside the menu.
+void editAppProxyList(Settings& settings,
+                      const std::vector<Profile>& profiles,
+                      std::function<bool(int&, int&)> startProxy,
+                      int& proxyPort, int& httpProxyPort);
 
 #endif // VL2_MENU_H

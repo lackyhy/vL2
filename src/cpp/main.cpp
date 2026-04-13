@@ -278,7 +278,39 @@ int main() {
                 // ── Per-app proxy manager ──────────────────────────────────
                 int activePort     = xrayRunning ? settings.proxyPort     : 0;
                 int activeHttpPort = xrayRunning ? settings.httpProxyPort : 0;
-                editAppProxyList(settings, activePort, activeHttpPort);
+
+                // Lambda: starts xray in proxy mode and updates port vars.
+                // Called automatically when user hits Launch and proxy is off.
+                auto startProxyForApp = [&](int& port, int& httpPort) -> bool {
+                    if (profiles.empty()) {
+                        clearScreen();
+                        std::cout << tr(settings.language,
+                            "No profiles — add one first in Profiles menu.",
+                            "Нет профилей — сначала добавьте в меню Профили.") << "\n";
+                        pauseScreen(tr(settings.language, "\nPress any key...", "\nЛюбая клавиша..."));
+                        return false;
+                    }
+                    // Pick profile
+                    int idx = pickProfile();
+                    if (idx < 0) return false;
+                    // SOCKS5 only for per-app proxy
+                    std::string logF, addr;
+                    ProcessId pid = 0;
+                    if (!launchXrayCore(settings, profiles[idx], false, "socks", logF, addr, pid))
+                        return false;
+                    activePid        = pid;
+                    activeLogFile    = logF;
+                    listenAddress    = addr;
+                    xrayRunning      = true;
+                    tunnelModeActive = false;
+                    tunModeActive    = false;
+                    systemVpnActive  = false;
+                    port     = settings.proxyPort;
+                    httpPort = settings.httpProxyPort;
+                    return true;
+                };
+
+                editAppProxyList(settings, profiles, startProxyForApp, activePort, activeHttpPort);
                 saveAppList(settings);
             } else if (selectedItem == profilesStr) {
                 editProfiles(profiles, settings.language);

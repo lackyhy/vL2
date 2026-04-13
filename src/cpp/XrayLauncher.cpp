@@ -983,7 +983,7 @@ static bool setupTunRoutes(const std::string& ifaceName,
         system(("sudo resolvectl dns " + ifaceName + dnsArgs + " 2>/dev/null").c_str());
         system(("sudo resolvectl domain " + ifaceName + " ~. 2>/dev/null").c_str());
         // Tell systemd-resolved this link is the default DNS for all domains
-        system("sudo resolvectl default-route " + ifaceName + " yes 2>/dev/null");
+        system(("sudo resolvectl default-route " + ifaceName + " yes 2>/dev/null").c_str());
     } else {
         // Fallback: edit /etc/resolv.conf directly
         system("sudo cp /etc/resolv.conf /tmp/vl2_resolv_backup 2>/dev/null");
@@ -1876,69 +1876,124 @@ std::string writeProxychainsConfig(int proxyPort) {
     return cfgPath;
 }
 
+// ── Detect Electron/Chromium-based apps ───────────────────────────────────
+// These apps ignore HTTP_PROXY env-vars and require --proxy-server CLI flag.
+static bool isElectronApp(const std::string& cmd) {
+    static const std::vector<std::string> knownElectron = {
+        "discord", "telegram", "telegram-desktop", "slack", "teams",
+        "code", "vscode", "vscodium", "atom", "notion", "obsidian",
+        "spotify", "skype", "viber", "element", "electron", "chromium",
+        "chrome", "brave", "opera"
+    };
+    std::string lower = cmd;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    for (const auto& name : knownElectron)
+        if (lower.find(name) != std::string::npos) return true;
+    return false;
+}
+
+// Resolve a bare command word ("discord") to its full path ("/usr/bin/discord").
+static std::string resolveBin(const std::string& word) {
+    if (word.empty() || word[0] == '/' || word[0] == '.') return word;
+    FILE* p = popen(("command -v " + word + " 2>/dev/null").c_str(), "r");
+    if (!p) return word;
+    char buf[512] = {0};
+    fgets(buf, sizeof(buf), p);
+    pclose(p);
+    buf[strcspn(buf, "\n ")] = '\0';
+    return buf[0] ? std::string(buf) : word;
+}
+
 void launchAppThroughProxy(const std::string& command, int proxyPort,
                            int httpProxyPort, Language lang) {
 #if defined(__unix__) || defined(__APPLE__)
     clearScreen();
     std::cout << "=== " << tr(lang, "Launch app through proxy", "Запуск приложения через прокси") << " ===\n\n";
     std::cout << tr(lang, "Command: ", "Команда: ") << command << "\n";
-    std::cout << tr(lang, "SOCKS5 proxy: 127.0.0.1:", "SOCKS5 прокси: 127.0.0.1:") << proxyPort << "\n\n";
+    std::cout << tr(lang, "SOCKS5:  127.0.0.1:", "SOCKS5:  127.0.0.1:") << proxyPort << "\n\n";
+
+    // ── Per-app log file ───────────────────────────────────────────────────
+    std::string appWord = command.substr(0, command.find(' '));
+    appWord = appWord.substr(appWord.rfind('/') + 1);
+    std::string logFile = "/tmp/vl2_app_" + appWord + ".log";
 
     std::string launchCmd;
+    bool electron = isElectronApp(command);
 
-    if (isProxychainsAvailable()) {
-        // proxychains forces ALL TCP connections through the proxy,
-        // even for apps that don't honour env-vars (e.g. curl without -x, etc.)
+    if (electron) {
+        // ── Electron / Chromium ────────────────────────────────────────────
+        // Split binary and extra args
+        size_t sp = command.find(' ');
+        std::string binWord  = command.substr(0, sp);
+        std::string restArgs = (sp != std::string::npos) ? command.substr(sp) : "";
+
+        std::string resolvedBin = resolveBin(binWord);
+
+        std::string proxyFlag = "--proxy-server=socks5://127.0.0.1:" + std::to_string(proxyPort);
+
+        std::cout << tr(lang,
+            "Electron app detected — injecting --proxy-server flag.\n",
+            "Обнаружено Electron-приложение — добавляется --proxy-server.\n");
+
+        launchCmd = "nohup \"" + resolvedBin + "\" " + proxyFlag + restArgs
+                    + " >\"" + logFile + "\" 2>&1 &";
+
+    } else if (isProxychainsAvailable()) {
+        // ── proxychains: intercepts all TCP syscalls ───────────────────────
         std::string cfgPath = writeProxychainsConfig(proxyPort);
-
-        // Detect which binary is available
         bool has4 = (system("command -v proxychains4 >/dev/null 2>&1") == 0);
         std::string pchains = has4 ? "proxychains4" : "proxychains";
 
-        launchCmd = pchains + " -f " + cfgPath + " " + command
-                    + " >/dev/null 2>&1 &";
+        std::cout << tr(lang,
+            "Using proxychains — all TCP from this app goes through proxy.\n",
+            "Используется proxychains — весь TCP приложения идёт через прокси.\n");
 
-        std::cout << tr(lang, "Using proxychains — all TCP traffic from this app goes through the proxy.",
-                              "Используется proxychains — весь TCP трафик приложения идёт через прокси.") << "\n";
+        launchCmd = "nohup " + pchains + " -f \"" + cfgPath + "\" " + command
+                    + " >\"" + logFile + "\" 2>&1 &";
     } else {
-        // Fallback: inject proxy env-vars.  Works for curl, wget, git, pip,
-        // npm, most GUI apps, etc.  Does NOT intercept hard-coded TCP.
-        std::string socksUrl  = "socks5://127.0.0.1:" + std::to_string(proxyPort);
-        std::string httpUrl   = httpProxyPort > 0
+        // ── Env-var fallback ───────────────────────────────────────────────
+        std::string socksUrl = "socks5://127.0.0.1:" + std::to_string(proxyPort);
+        std::string httpUrl  = httpProxyPort > 0
             ? ("http://127.0.0.1:" + std::to_string(httpProxyPort))
             : ("http://127.0.0.1:" + std::to_string(proxyPort));
 
-        launchCmd = "env "
-            "ALL_PROXY="   + socksUrl  + " "
-            "all_proxy="   + socksUrl  + " "
-            "HTTP_PROXY="  + httpUrl   + " "
-            "http_proxy="  + httpUrl   + " "
-            "HTTPS_PROXY=" + httpUrl   + " "
-            "https_proxy=" + httpUrl   + " "
-            + command + " >/dev/null 2>&1 &";
-
         std::cout << tr(lang,
-            "proxychains not found — using proxy environment variables.\n"
-            "Install proxychains-ng for better coverage (pacman -S proxychains-ng).",
-            "proxychains не найден — используются переменные окружения прокси.\n"
-            "Установите proxychains-ng для лучшего покрытия (pacman -S proxychains-ng).") << "\n";
+            "Using proxy env-vars (HTTP_PROXY / ALL_PROXY).\n"
+            "  For Electron apps (Discord etc.) this may not work — they need proxychains.\n"
+            "  Install: pacman -S proxychains-ng\n",
+            "Используются переменные окружения прокси (HTTP_PROXY / ALL_PROXY).\n"
+            "  Для Electron-приложений (Discord и т.д.) нужен proxychains.\n"
+            "  Установка: pacman -S proxychains-ng\n");
+
+        launchCmd = "nohup env"
+                    " ALL_PROXY="   + socksUrl + " all_proxy="   + socksUrl +
+                    " HTTP_PROXY="  + httpUrl  + " http_proxy="  + httpUrl  +
+                    " HTTPS_PROXY=" + httpUrl  + " https_proxy=" + httpUrl  +
+                    " " + command + " >\"" + logFile + "\" 2>&1 &";
     }
 
-    std::cout << "\n" << tr(lang, "Launching...", "Запуск...") << "\n";
+    std::cout << tr(lang, "Launching...", "Запуск...") << "\n";
     int ret = system(launchCmd.c_str());
+
     if (ret == 0) {
-        std::cout << tr(lang, "App launched in background.", "Приложение запущено в фоне.") << "\n";
+        std::cout << tr(lang, "App started in background.\n", "Приложение запущено в фоне.\n");
+        std::cout << tr(lang, "Log: ", "Лог: ") << logFile << "\n";
+        usleep(1200000); // wait 1.2s for app to produce initial output
+        std::cout << "\n--- " << tr(lang, "last output:", "последний вывод:") << " ---\n";
+        system(("tail -8 \"" + logFile + "\" 2>/dev/null || echo '(no output yet)'").c_str());
+        std::cout << "---\n";
     } else {
-        std::cout << tr(lang, "Warning: launch command returned non-zero.", "Предупреждение: команда вернула ненулевой код.") << "\n";
+        std::cout << tr(lang, "Launch returned error. Log:\n", "Запуск вернул ошибку. Лог:\n");
+        system(("cat \"" + logFile + "\" 2>/dev/null").c_str());
     }
     pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
 #else
     (void)command; (void)proxyPort; (void)httpProxyPort;
     clearScreen();
     std::cout << tr(lang,
-        "Per-app proxy via env-vars is not supported on Windows in this build.\n"
+        "Per-app proxy is not supported on Windows in this build.\n"
         "Use system proxy settings or a tool like Proxifier.",
-        "Прокси для отдельных приложений через env-vars не поддерживается в Windows в этой сборке.\n"
+        "Прокси для отдельных приложений не поддерживается в Windows в этой сборке.\n"
         "Используйте системные настройки прокси или программу Proxifier.") << "\n";
     pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
 #endif

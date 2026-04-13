@@ -812,10 +812,17 @@ void loadSettings(Settings& settings) {
 
 // ── Per-app proxy UI ───────────────────────────────────────────────────────
 
-static void printAppProxyMenu(const Settings& settings) {
+static void printAppProxyMenu(const Settings& settings, int proxyPort) {
     Language lang = settings.language;
     clearScreen();
-    std::cout << "=== " << tr(lang, "Per-app proxy", "Прокси для приложений") << " ===\n\n";
+    std::cout << "=== " << tr(lang, "Per-app proxy", "Прокси для приложений") << " ===\n";
+    if (proxyPort > 0)
+        std::cout << tr(lang, "Proxy: ", "Прокси: ") << "SOCKS5 127.0.0.1:" << proxyPort
+                  << "  [" << tr(lang, "running", "запущен") << "]\n";
+    else
+        std::cout << tr(lang, "Proxy: not running (will auto-start on launch)",
+                              "Прокси: не запущен (запустится автоматически)") << "\n";
+    std::cout << "\n";
 
     if (!settings.appList.empty()) {
         std::cout << tr(lang, "Configured apps:", "Настроенные приложения:") << "\n";
@@ -840,13 +847,17 @@ static void printAppProxyMenu(const Settings& settings) {
         "0. Назад\n");
 }
 
-// Show the per-app proxy manager.
-// proxyPort and httpProxyPort are the currently active proxy ports
-// (pass 0 if xray is not running — launch will warn the user).
-void editAppProxyList(Settings& settings, int proxyPort, int httpProxyPort) {
+// Per-app proxy manager.
+// startProxy is called automatically when an app is launched and proxy is off.
+// It should start xray and fill proxyPort/httpProxyPort; returns true on success.
+void editAppProxyList(Settings& settings,
+                      const std::vector<Profile>& profiles,
+                      std::function<bool(int&, int&)> startProxy,
+                      int& proxyPort, int& httpProxyPort) {
+    (void)profiles; // reserved for future profile-specific routing
     Language lang = settings.language;
     while (true) {
-        printAppProxyMenu(settings);
+        printAppProxyMenu(settings, proxyPort);
         int key = readKey();
         if (key == 3) continue;
         if (key == '0') break;
@@ -854,15 +865,22 @@ void editAppProxyList(Settings& settings, int proxyPort, int httpProxyPort) {
         if (key == 'a' || key == 'A') {
             // ── Add entry ──────────────────────────────────────────────────
             clearScreen();
+            std::cout << "=== " << tr(lang, "Add app", "Добавить приложение") << " ===\n\n";
             std::cout << tr(lang,
-                "Add app to per-app proxy list.\n"
-                "Enter a display name and the command (full path or shell command).\n",
-                "Добавить приложение в список прокси.\n"
-                "Введите имя и команду (полный путь или команда shell).\n") << "\n";
+                "Enter the name and the launch command.\n"
+                "For Electron apps (Discord, Telegram, etc.) you can omit --proxy-server —\n"
+                "vL2 adds it automatically.\n\n",
+                "Введите имя и команду запуска.\n"
+                "Для Electron-приложений (Discord, Telegram и т.д.) --proxy-server не нужен —\n"
+                "vL2 добавит его автоматически.\n\n");
 
-            std::string name = inputString(tr(lang, "Display name: ", "Отображаемое имя: "), lang);
+            std::string name = inputString(tr(lang, "Name: ", "Имя: "), lang);
             if (name.empty()) continue;
-            std::string cmd  = inputString(tr(lang, "Command (e.g. /usr/bin/firefox): ", "Команда (например /usr/bin/firefox): "), lang);
+            std::string cmd  = inputString(
+                tr(lang,
+                   "Command (e.g. discord, /usr/bin/firefox, curl https://ifconfig.me): ",
+                   "Команда (напр. discord, /usr/bin/firefox, curl https://ifconfig.me): "),
+                lang);
             if (cmd.empty()) continue;
 
             AppEntry e;
@@ -870,32 +888,43 @@ void editAppProxyList(Settings& settings, int proxyPort, int httpProxyPort) {
             e.command = cmd;
             settings.appList.push_back(e);
             saveAppList(settings);
-            std::cout << tr(lang, "Added.", "Добавлено.") << "\n";
+            std::cout << "\n" << tr(lang, "Added.", "Добавлено.") << "\n";
             pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
 
         } else if (key == 'l' || key == 'L') {
             // ── Launch ─────────────────────────────────────────────────────
             if (settings.appList.empty()) {
                 clearScreen();
-                std::cout << tr(lang, "No apps configured. Add one first.", "Нет приложений. Сначала добавьте.") << "\n";
+                std::cout << tr(lang, "No apps configured. Add one first (A).",
+                                      "Нет приложений. Сначала добавьте (A).") << "\n";
                 pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
                 continue;
             }
+
+            // ── Auto-start proxy if not running ────────────────────────────
             if (proxyPort <= 0) {
                 clearScreen();
                 std::cout << tr(lang,
-                    "xray proxy is not running. Start it first (Launch xray-core > proxy mode).",
-                    "Прокси xray не запущен. Сначала запустите xray-core в режиме прокси.") << "\n";
-                pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
-                continue;
+                    "Proxy is not running. Starting xray-core now...\n",
+                    "Прокси не запущен. Запускаю xray-core...\n") << "\n";
+                if (!startProxy(proxyPort, httpProxyPort)) {
+                    std::cout << tr(lang,
+                        "Failed to start proxy. Cannot launch app.",
+                        "Не удалось запустить прокси. Запуск приложения невозможен.") << "\n";
+                    pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
+                    continue;
+                }
             }
+
+            // ── Pick app ───────────────────────────────────────────────────
             clearScreen();
-            std::cout << tr(lang, "Select app to launch:", "Выберите приложение для запуска:") << "\n\n";
+            std::cout << tr(lang, "Select app to launch:", "Выберите приложение для запуска:") << "\n";
+            std::cout << tr(lang, "Proxy: SOCKS5 127.0.0.1:", "Прокси: SOCKS5 127.0.0.1:") << proxyPort << "\n\n";
             for (size_t i = 0; i < settings.appList.size(); ++i) {
                 std::cout << "  " << i + 1 << ". " << settings.appList[i].name
                           << "  [" << settings.appList[i].command << "]\n";
             }
-            std::cout << "\n" << tr(lang, "Press number (1-9) or 0 to cancel: ", "Нажмите цифру (1-9) или 0 для отмены: ");
+            std::cout << "\n" << tr(lang, "Number (1-9) or 0 to cancel: ", "Цифра (1-9) или 0 для отмены: ");
             int sel = readKey();
             if (sel >= '1' && sel <= '0' + static_cast<int>(settings.appList.size())) {
                 size_t idx = sel - '1';
@@ -913,14 +942,16 @@ void editAppProxyList(Settings& settings, int proxyPort, int httpProxyPort) {
             clearScreen();
             std::cout << tr(lang, "Select app to delete:", "Выберите приложение для удаления:") << "\n\n";
             for (size_t i = 0; i < settings.appList.size(); ++i) {
-                std::cout << "  " << i + 1 << ". " << settings.appList[i].name << "\n";
+                std::cout << "  " << i + 1 << ". " << settings.appList[i].name
+                          << "  [" << settings.appList[i].command << "]\n";
             }
-            std::cout << "\n" << tr(lang, "Press number (1-9) or 0 to cancel: ", "Нажмите цифру (1-9) или 0 для отмены: ");
+            std::cout << "\n" << tr(lang, "Number or 0 to cancel: ", "Цифра или 0 для отмены: ");
             int sel = readKey();
             if (sel >= '1' && sel <= '0' + static_cast<int>(settings.appList.size())) {
                 size_t idx = sel - '1';
-                std::cout << "\n" << tr(lang, "Delete: ", "Удалить: ") << settings.appList[idx].name
-                          << tr(lang, "? (Y/N) ", "? (Y/N) ");
+                std::cout << "\n" << tr(lang, "Delete '", "Удалить '")
+                          << settings.appList[idx].name
+                          << tr(lang, "'? (Y/N) ", "'? (Y/N) ");
                 int confirm = readKey();
                 if (confirm == 'y' || confirm == 'Y') {
                     settings.appList.erase(settings.appList.begin() + idx);

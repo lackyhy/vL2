@@ -1,7 +1,11 @@
 # Build directories
 build/
 cmake-build-*/
-
+CMakeFiles/
+CMakeCache.txt
+CMakeScripts/
+Makefile
+cmake_install.cmake
 # IDE files
 .vscode/
 .idea/
