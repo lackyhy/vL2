@@ -15,6 +15,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pwd.h>
 #endif
 #ifdef _WIN32
 #include <windows.h>
@@ -1996,5 +1997,320 @@ void launchAppThroughProxy(const std::string& command, int proxyPort,
         "Прокси для отдельных приложений не поддерживается в Windows в этой сборке.\n"
         "Используйте системные настройки прокси или программу Proxifier.") << "\n";
     pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+#endif
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VPN NAMESPACE MODE  (Linux only)
+//
+// Creates an isolated network namespace (vl2ns) where ALL TCP/UDP traffic
+// from any app is forced through xray's SOCKS5 proxy via tun2socks.
+// Unlike the proxy env-var approach, this works for every app — including
+// those that ignore HTTP_PROXY (Discord, games, custom binaries, etc.).
+//
+// Architecture:
+//   main netns         vl2ns
+//   ──────────         ─────────────────────────────────────────
+//   xray SOCKS5  ←──  veth10200.0.1  ←── tun2socks ←── vl2tun
+//   0.0.0.0:1080       10.200.0.2                          ↑
+//                                               all app TCP/UDP
+//
+// Requirements: iproute2, tun2socks, iptables
+//   sudo pacman -S iproute2 tun2socks iptables
+// ═══════════════════════════════════════════════════════════════════════════
+
+static const std::string NS_NAME    = "vl2ns";
+static const std::string NS_VETH_H  = "vl2h";   // host side
+static const std::string NS_VETH_N  = "vl2n";   // namespace side
+static const std::string NS_HOST_IP = "10.200.0.1";
+static const std::string NS_NS_IP   = "10.200.0.2";
+static const std::string NS_SUBNET  = "10.200.0.0/24";
+static const std::string NS_TUN     = "vl2tun";
+
+bool isNetNSModeAvailable() {
+#ifdef __linux__
+    return system("command -v ip        >/dev/null 2>&1") == 0 &&
+           system("command -v tun2socks >/dev/null 2>&1") == 0;
+#else
+    return false;
+#endif
+}
+
+// ── Generate xray SOCKS5 config that binds to ALL interfaces ───────────────
+// Needed so xray is reachable at 10.200.0.1:<port> from inside the namespace.
+std::string generateNetNSSocksConfig(const Profile& profile, const Settings& settings) {
+    std::ostringstream oss;
+    int port = settings.proxyPort > 0 ? settings.proxyPort : 1080;
+
+    auto logLevelStr = [&]() -> std::string {
+        switch (settings.logLevel) {
+            case 1: return "debug"; case 2: return "info";
+            case 3: return "warning"; case 4: return "error";
+            case 5: return "none"; default: return "warning";
+        }
+    }();
+
+    oss << "{\n"
+        << "  \"log\": { \"loglevel\": \"" << logLevelStr << "\" },\n"
+        << "  \"inbounds\": [{\n"
+        << "    \"port\": " << port << ",\n"
+        << "    \"listen\": \"0.0.0.0\",\n"   // ← all interfaces
+        << "    \"protocol\": \"socks\",\n"
+        << "    \"settings\": { \"auth\": \"noauth\" },\n"
+        << "    \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] }\n"
+        << "  }],\n"
+        << "  \"outbounds\": [{\n"
+        << "    \"tag\": \"proxy\",\n";
+    appendOutbound(oss, profile);
+    oss << "\n  },{\n"
+        << "    \"tag\": \"direct\",\n"
+        << "    \"protocol\": \"freedom\",\n"
+        << "    \"settings\": {}\n"
+        << "  }],\n"
+        << "  \"routing\": {\n"
+        << "    \"domainStrategy\": \"IPIfNonMatch\",\n"
+        << "    \"rules\": [{\n"
+        << "      \"type\": \"field\",\n"
+        << "      \"ip\": [\"geoip:private\"],\n"
+        << "      \"outboundTag\": \"direct\"\n"
+        << "    }]\n"
+        << "  }\n"
+        << "}\n";
+    return oss.str();
+}
+
+// ── Start xray SOCKS5 listening on 0.0.0.0 for netns mode ─────────────────
+bool launchXrayCoreForNetNS(const Settings& settings, const Profile& profile,
+                            std::string& outLogFile, ProcessId& outPid) {
+#if defined(__unix__) || defined(__APPLE__)
+    std::string binaryPath = findXrayCoreBinary(settings);
+    if (binaryPath.empty()) return false;
+
+    std::string config = generateNetNSSocksConfig(profile, settings);
+    std::ofstream cf("config_netns.json");
+    if (!cf) return false;
+    cf << config;
+    cf.close();
+
+    outLogFile = "xray-netns.log";
+    std::string cmd = "nohup \"" + binaryPath + "\" -config config_netns.json >"
+                    + outLogFile + " 2>&1 & echo $!";
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return false;
+    char buf[32] = {0};
+    fgets(buf, sizeof(buf), p);
+    pclose(p);
+    outPid = strtol(buf, nullptr, 10);
+    return outPid > 0;
+#else
+    (void)settings; (void)profile; (void)outLogFile; (void)outPid;
+    return false;
+#endif
+}
+
+// ── Get current (non-root) username ───────────────────────────────────────
+#ifdef __linux__
+static std::string getCurrentUser() {
+    const char* u = getenv("SUDO_USER");
+    if (u && u[0]) return u;
+    u = getenv("USER");
+    if (u && u[0]) return u;
+    struct passwd* pw = getpwuid(getuid());
+    if (pw) return pw->pw_name;
+    return "";
+}
+#endif
+
+// ── Create the VPN network namespace and start tun2socks ───────────────────
+bool setupAppNetNS(int socksPort, Language lang) {
+#ifdef __linux__
+    std::cout << tr(lang,
+        "Setting up VPN network namespace (requires sudo)...\n",
+        "Настройка VPN сетевого пространства имён (требует sudo)...\n");
+
+    // Tear down any previous state
+    system(("sudo ip netns del " + NS_NAME + " 2>/dev/null").c_str());
+    system(("sudo ip link del " + NS_VETH_H + " 2>/dev/null").c_str());
+    usleep(200000);
+
+    // 1. Create network namespace
+    if (system(("sudo ip netns add " + NS_NAME).c_str()) != 0) {
+        std::cout << tr(lang,
+            "ERROR: cannot create network namespace. Is iproute2 installed and are you running with sudo?\n",
+            "ОШИБКА: не удалось создать сетевое пространство имён. Установлен ли iproute2 и запущено ли с sudo?\n");
+        return false;
+    }
+
+    // 2. veth pair: vl2h (host) ↔ vl2n (namespace)
+    system(("sudo ip link add " + NS_VETH_H + " type veth peer name " + NS_VETH_N).c_str());
+    system(("sudo ip link set " + NS_VETH_N + " netns " + NS_NAME).c_str());
+
+    // 3. Configure host side of veth
+    system(("sudo ip addr add " + NS_HOST_IP + "/24 dev " + NS_VETH_H).c_str());
+    system(("sudo ip link set " + NS_VETH_H + " up").c_str());
+
+    // 4. Configure namespace side of veth
+    auto ns = [](const std::string& cmd) {
+        system(("sudo ip netns exec " + NS_NAME + " " + cmd).c_str());
+    };
+    ns("ip addr add " + NS_NS_IP + "/24 dev " + NS_VETH_N);
+    ns("ip link set " + NS_VETH_N + " up");
+    ns("ip link set lo up");
+
+    // 5. IP forwarding on host so namespace traffic can reach xray
+    system("sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1");
+    system(("sudo iptables -t nat -A POSTROUTING -s " + NS_SUBNET + " -j MASQUERADE 2>/dev/null").c_str());
+
+    // 6. DNS for namespace via /etc/netns/<name>/resolv.conf
+    //    (ip netns exec reads this file automatically when looking up names)
+    system(("sudo mkdir -p /etc/netns/" + NS_NAME).c_str());
+    {
+        std::ofstream rc("/tmp/vl2_ns_resolv.conf");
+        rc << "nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
+    }
+    system(("sudo cp /tmp/vl2_ns_resolv.conf /etc/netns/" + NS_NAME + "/resolv.conf").c_str());
+
+    // 7. TUN device inside namespace (tun2socks will use this)
+    ns("ip tuntap add mode tun name " + NS_TUN);
+    ns("ip addr add 198.18.0.1/15 dev " + NS_TUN);   // tun2socks default range
+    ns("ip link set " + NS_TUN + " up");
+
+    // 8. Routing inside namespace:
+    //    - veth route (10.200.0.0/24) stays direct → reach xray on host
+    //    - everything else → through TUN (tun2socks handles it)
+    ns("ip route add default dev " + NS_TUN);
+
+    // 9. Start tun2socks inside the namespace.
+    //    It reads from vl2tun and forwards all TCP/UDP via SOCKS5 to xray.
+    //    xray listens on 0.0.0.0:port so it's reachable at 10.200.0.1:port.
+    std::string t2sCmd =
+        "sudo ip netns exec " + NS_NAME + " tun2socks"
+        " -device "  + NS_TUN +
+        " -proxy socks5://" + NS_HOST_IP + ":" + std::to_string(socksPort) +
+        " -loglevel error"
+        " >/tmp/vl2_tun2socks.log 2>&1 &";
+
+    std::cout << tr(lang, "Starting tun2socks... ", "Запуск tun2socks... ");
+    std::cout.flush();
+    system(t2sCmd.c_str());
+    usleep(1500000);   // let tun2socks initialise
+
+    // 10. Quick connectivity test from inside the namespace
+    int testRet = system(("sudo ip netns exec " + NS_NAME +
+                          " ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1").c_str());
+    if (testRet != 0) {
+        std::cout << tr(lang, "FAIL\n", "ОШИБКА\n");
+        std::cout << tr(lang,
+            "Connectivity test failed. tun2socks log:\n",
+            "Тест соединения не прошёл. Лог tun2socks:\n");
+        system("tail -15 /tmp/vl2_tun2socks.log 2>/dev/null");
+        std::cout << tr(lang,
+            "\nNamespace is still set up — app may work even without ping.\n",
+            "\nПространство имён всё ещё создано — приложение может работать несмотря на ошибку ping.\n");
+    } else {
+        std::cout << tr(lang, "OK\n", "OK\n");
+    }
+
+    // Save port for cleanup reference
+    { std::ofstream f("/tmp/vl2_netns_port"); f << socksPort; }
+
+    std::cout << tr(lang,
+        "VPN namespace ready. ALL traffic from apps launched here goes through VLESS+Reality.\n",
+        "VPN пространство имён готово. ВЕСЬ трафик запущенных приложений идёт через VLESS+Reality.\n");
+    return true;
+#else
+    (void)socksPort; (void)lang;
+    return false;
+#endif
+}
+
+// ── Tear down the VPN namespace ────────────────────────────────────────────
+void cleanupAppNetNS() {
+#ifdef __linux__
+    // Kill tun2socks
+    system(("sudo ip netns exec " + NS_NAME + " pkill tun2socks 2>/dev/null").c_str());
+    usleep(300000);
+
+    // iptables cleanup
+    system(("sudo iptables -t nat -D POSTROUTING -s " + NS_SUBNET + " -j MASQUERADE 2>/dev/null").c_str());
+
+    // Delete namespace (also removes the veth peer inside it)
+    system(("sudo ip netns del " + NS_NAME + " 2>/dev/null").c_str());
+    // Remove host-side veth (may already be gone when namespace was deleted)
+    system(("sudo ip link del " + NS_VETH_H + " 2>/dev/null").c_str());
+
+    // Remove DNS override
+    system(("sudo rm -rf /etc/netns/" + NS_NAME).c_str());
+    system("rm -f /tmp/vl2_netns_port /tmp/vl2_ns_resolv.conf /tmp/vl2_tun2socks.log");
+#endif
+}
+
+// ── Launch an app inside the VPN namespace as the current user ────────────
+bool launchAppInNetNS(const std::string& command, Language lang) {
+#ifdef __linux__
+    clearScreen();
+    std::cout << "=== " << tr(lang, "Launch in VPN namespace", "Запуск в VPN пространстве имён") << " ===\n\n";
+    std::cout << tr(lang, "Command: ", "Команда: ") << command << "\n";
+    std::cout << tr(lang,
+        "ALL traffic from this app goes through VLESS+Reality.\n\n",
+        "ВЕСЬ трафик этого приложения идёт через VLESS+Reality.\n\n");
+
+    std::string user = getCurrentUser();
+    if (user.empty()) {
+        std::cout << tr(lang,
+            "ERROR: cannot determine current user.\n",
+            "ОШИБКА: не удалось определить текущего пользователя.\n");
+        pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
+        return false;
+    }
+
+    // Collect display/session env vars so GUI apps work from inside netns.
+    // Filesystem (X11/Wayland sockets) is shared — only network is isolated.
+    std::string envStr;
+    auto addEnv = [&](const char* var) {
+        const char* v = getenv(var);
+        if (v && v[0]) {
+            envStr += std::string(var) + "='" + v + "' ";
+        }
+    };
+    addEnv("DISPLAY");
+    addEnv("WAYLAND_DISPLAY");
+    addEnv("XDG_RUNTIME_DIR");
+    addEnv("HOME");
+    addEnv("DBUS_SESSION_BUS_ADDRESS");
+    addEnv("XAUTHORITY");
+
+    // Log file
+    std::string appWord = command.substr(0, command.find(' '));
+    appWord = appWord.substr(appWord.rfind('/') + 1);
+    std::string logFile = "/tmp/vl2_ns_" + appWord + ".log";
+
+    // ip netns exec runs as root; we drop back to the original user with sudo -u.
+    // sh -c lets us set env vars as a preamble.
+    std::string launchCmd =
+        "nohup sudo ip netns exec " + NS_NAME +
+        " sudo -u " + user + " -- sh -c '" + envStr + command + "'"
+        " >'" + logFile + "' 2>&1 &";
+
+    std::cout << tr(lang, "Launching...\n", "Запуск...\n");
+    int ret = system(launchCmd.c_str());
+
+    usleep(1500000);
+    std::cout << tr(lang, "Log: ", "Лог: ") << logFile << "\n";
+    std::cout << "\n--- " << tr(lang, "last output:", "последний вывод:") << " ---\n";
+    system(("tail -8 '" + logFile + "' 2>/dev/null || echo '(no output yet)'").c_str());
+    std::cout << "---\n";
+
+    if (ret != 0) {
+        std::cout << tr(lang,
+            "\nWarning: launch returned non-zero exit code.\n",
+            "\nПредупреждение: команда запуска вернула ненулевой код.\n");
+    }
+
+    pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+    return true;
+#else
+    (void)command; (void)lang;
+    return false;
 #endif
 }

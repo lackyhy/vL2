@@ -916,10 +916,55 @@ void editAppProxyList(Settings& settings,
                 }
             }
 
+            // ── Choose launch mode ─────────────────────────────────────────
+            clearScreen();
+            std::cout << "=== " << tr(lang, "Launch mode", "Режим запуска") << " ===\n\n";
+            std::cout << tr(lang,
+                "1. Proxy mode  — env vars / --proxy-server (fast, no extra deps)\n"
+                "2. VPN mode    — network namespace + tun2socks\n"
+                "                 ALL traffic through VLESS+Reality, works for any app\n"
+                "                 Requires: sudo pacman -S tun2socks\n",
+                "1. Прокси режим — env vars / --proxy-server (быстро, без доп. зависимостей)\n"
+                "2. VPN режим    — сетевое пространство имён + tun2socks\n"
+                "                  ВЕСЬ трафик через VLESS+Reality, работает с любым приложением\n"
+                "                  Требуется: sudo pacman -S tun2socks\n");
+#ifndef __linux__
+            std::cout << tr(lang,
+                "\n(VPN namespace mode is Linux-only; option 2 unavailable)\n",
+                "\n(VPN namespace режим только для Linux; опция 2 недоступна)\n");
+#endif
+            std::cout << "\n" << tr(lang, "Press 1 or 2: ", "Нажмите 1 или 2: ");
+            int modeKey = readKey();
+            bool vpnNsMode = (modeKey == '2');
+
+#ifdef __linux__
+            if (vpnNsMode && !isNetNSModeAvailable()) {
+                clearScreen();
+                std::cout << tr(lang,
+                    "tun2socks not found.\n"
+                    "Install: sudo pacman -S tun2socks\n"
+                    "Falling back to proxy mode.\n",
+                    "tun2socks не найден.\n"
+                    "Установите: sudo pacman -S tun2socks\n"
+                    "Переключаюсь на прокси режим.\n");
+                pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
+                vpnNsMode = false;
+            }
+#else
+            vpnNsMode = false;
+#endif
+
             // ── Pick app ───────────────────────────────────────────────────
             clearScreen();
             std::cout << tr(lang, "Select app to launch:", "Выберите приложение для запуска:") << "\n";
-            std::cout << tr(lang, "Proxy: SOCKS5 127.0.0.1:", "Прокси: SOCKS5 127.0.0.1:") << proxyPort << "\n\n";
+            if (vpnNsMode)
+                std::cout << tr(lang,
+                    "Mode: VPN namespace — ALL traffic via proxy\n",
+                    "Режим: VPN пространство имён — ВЕСЬ трафик через прокси\n");
+            else
+                std::cout << tr(lang, "Mode: Proxy (env / --proxy-server)\n",
+                                      "Режим: Прокси (env / --proxy-server)\n");
+            std::cout << "\n";
             for (size_t i = 0; i < settings.appList.size(); ++i) {
                 std::cout << "  " << i + 1 << ". " << settings.appList[i].name
                           << "  [" << settings.appList[i].command << "]\n";
@@ -928,7 +973,11 @@ void editAppProxyList(Settings& settings,
             int sel = readKey();
             if (sel >= '1' && sel <= '0' + static_cast<int>(settings.appList.size())) {
                 size_t idx = sel - '1';
-                launchAppThroughProxy(settings.appList[idx].command, proxyPort, httpProxyPort, lang);
+                if (vpnNsMode) {
+                    launchAppInNetNS(settings.appList[idx].command, lang);
+                } else {
+                    launchAppThroughProxy(settings.appList[idx].command, proxyPort, httpProxyPort, lang);
+                }
             }
 
         } else if (key == 'd' || key == 'D') {

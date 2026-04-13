@@ -2,6 +2,9 @@
 #include <vector>
 #include <filesystem>
 #include <signal.h>
+#if defined(__unix__) || defined(__APPLE__)
+#include <unistd.h>
+#endif
 #include "ConsoleUtils.h"
 #include "Menu.h"
 #include "XrayLauncher.h"
@@ -18,6 +21,7 @@ int main() {
     bool tunnelModeActive = false;   // legacy transparent-proxy tunnel
     bool tunModeActive    = false;   // real TUN virtual interface mode
     bool systemVpnActive  = false;
+    bool netNsActive      = false;   // VPN network namespace is set up
     ProcessId activePid   = 0;
     std::string listenAddress;
     std::string activeLogFile;
@@ -154,6 +158,7 @@ int main() {
         if (key == 'q' || key == 'Q') { // q/Q — exit
             showCursor();
             clearScreen();
+            if (netNsActive)     cleanupAppNetNS();
             if (systemVpnActive) cleanupSystemVPN(settings);
             if (tunModeActive)   cleanupTunVPN(settings);
             if (activePid > 0)   stopXrayCore(activePid);
@@ -174,6 +179,7 @@ int main() {
                 // User chose "Exit" from tray context menu
                 showCursor();
                 clearScreen();
+                if (netNsActive)     cleanupAppNetNS();
                 if (systemVpnActive) cleanupSystemVPN(settings);
                 if (tunModeActive)   cleanupTunVPN(settings);
                 if (activePid > 0)   stopXrayCore(activePid);
@@ -279,7 +285,9 @@ int main() {
                 int activePort     = xrayRunning ? settings.proxyPort     : 0;
                 int activeHttpPort = xrayRunning ? settings.httpProxyPort : 0;
 
-                // Lambda: starts xray in proxy mode and updates port vars.
+                // Lambda: starts xray for per-app proxy.
+                // For VPN namespace mode, xray must listen on 0.0.0.0 so the
+                // namespace can reach it via the veth IP (10.200.0.1).
                 // Called automatically when user hits Launch and proxy is off.
                 auto startProxyForApp = [&](int& port, int& httpPort) -> bool {
                     if (profiles.empty()) {
@@ -290,21 +298,36 @@ int main() {
                         pauseScreen(tr(settings.language, "\nPress any key...", "\nЛюбая клавиша..."));
                         return false;
                     }
-                    // Pick profile
                     int idx = pickProfile();
                     if (idx < 0) return false;
-                    // SOCKS5 only for per-app proxy
-                    std::string logF, addr;
+
+                    // Stop previous xray if running (need to restart with netns config)
+                    if (activePid > 0) {
+                        stopXrayCore(activePid);
+                        activePid   = 0;
+                        xrayRunning = false;
+                    }
+
+                    std::string logF;
                     ProcessId pid = 0;
-                    if (!launchXrayCore(settings, profiles[idx], false, "socks", logF, addr, pid))
+                    // Start xray listening on 0.0.0.0 (required for VPN netns mode)
+                    if (!launchXrayCoreForNetNS(settings, profiles[idx], logF, pid))
                         return false;
                     activePid        = pid;
                     activeLogFile    = logF;
-                    listenAddress    = addr;
+                    listenAddress    = "0.0.0.0:" + std::to_string(settings.proxyPort);
                     xrayRunning      = true;
                     tunnelModeActive = false;
                     tunModeActive    = false;
                     systemVpnActive  = false;
+
+                    // Give xray a moment to start, then set up the namespace
+                    usleep(800000);
+                    if (isNetNSModeAvailable()) {
+                        if (netNsActive) cleanupAppNetNS();
+                        netNsActive = setupAppNetNS(settings.proxyPort, settings.language);
+                    }
+
                     port     = settings.proxyPort;
                     httpPort = settings.httpProxyPort;
                     return true;
@@ -373,6 +396,10 @@ int main() {
                 systemVpnActive = false;
             } else if (selectedItem == stopStr) {
                 clearScreen();
+                if (netNsActive) {
+                    cleanupAppNetNS();
+                    netNsActive = false;
+                }
                 if (systemVpnActive) {
                     cleanupSystemVPN(settings);
                     systemVpnActive = false;
@@ -395,6 +422,7 @@ int main() {
             } else if (selectedItem == exitStr) {
                 showCursor();
                 clearScreen();
+                if (netNsActive)     cleanupAppNetNS();
                 if (systemVpnActive) cleanupSystemVPN(settings);
                 if (tunModeActive)   cleanupTunVPN(settings);
                 if (activePid > 0)   stopXrayCore(activePid);

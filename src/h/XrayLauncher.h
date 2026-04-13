@@ -46,4 +46,30 @@ bool isProxychainsAvailable();
 // Returns the path to the generated config file.
 std::string writeProxychainsConfig(int proxyPort);
 
+// ── VPN namespace mode (Linux only) ───────────────────────────────────────
+// Routes ALL traffic from an app through xray via a network namespace +
+// tun2socks. Works for every app including those ignoring env-var proxies.
+// Requires: iproute2, tun2socks   (pacman -S iproute2 tun2socks)
+
+// Returns true if all required tools are available (ip, tun2socks).
+bool isNetNSModeAvailable();
+
+// Generate xray SOCKS5 config that listens on 0.0.0.0 (all interfaces).
+// Required for the namespace to reach xray on the host via the veth IP.
+std::string generateNetNSSocksConfig(const Profile& profile, const Settings& settings);
+
+// Start xray with the netns config (0.0.0.0 listen).
+bool launchXrayCoreForNetNS(const Settings& settings, const Profile& profile,
+                            std::string& outLogFile, ProcessId& outPid);
+
+// Create the vl2ns network namespace, veth pair, tun device, and start
+// tun2socks inside the namespace pointing at xray SOCKS5 on the host.
+bool setupAppNetNS(int socksPort, Language lang);
+
+// Tear down the VPN namespace, veth, and iptables rules.
+void cleanupAppNetNS();
+
+// Launch command inside the VPN namespace as the current (non-root) user.
+bool launchAppInNetNS(const std::string& command, Language lang);
+
 #endif // VL2_XRAY_LAUNCHER_H
