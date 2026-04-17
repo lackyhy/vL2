@@ -4,6 +4,8 @@
 #include <signal.h>
 #if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
+#elif defined(_WIN32)
+#include <windows.h>
 #endif
 #include "ConsoleUtils.h"
 #include "Menu.h"
@@ -348,7 +350,11 @@ int main() {
                     systemVpnActive  = false;
 
                     // Give xray a moment to start, then set up the namespace
+#ifdef _WIN32
+                    Sleep(800);
+#else
                     usleep(800000);
+#endif
                     if (isNetNSModeAvailable()) {
                         if (netNsActive) cleanupAppNetNS();
                         netNsActive = setupAppNetNS(settings.proxyPort, settings.language);
