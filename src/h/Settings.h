@@ -2,6 +2,15 @@
 #define VL2_SETTINGS_H
 
 #include <string>
+#include <vector>
+
+// A single entry in the per-app proxy list.
+// When the proxy is running, vL2 can launch these commands with proxy env-vars
+// (or via proxychains if available) so only those apps go through the proxy.
+struct AppEntry {
+    std::string name;    // display label
+    std::string command; // executable path or shell command
+};
 
 struct Profile {
     std::string name;
@@ -58,6 +67,11 @@ struct Settings {
     // ── Second proxy instance ─────────────────────────────────────────────────
     // Local inbound port for the second xray-core proxy (0 = use default 1081).
     int proxy2Port = 1081;
+
+    // ── Per-app proxy list ────────────────────────────────────────────────────
+    // Apps/commands the user wants to route through the SOCKS5 proxy.
+    // vL2 launches them with proxy env-vars (or proxychains if installed).
+    std::vector<AppEntry> appList;
 };
 
 #endif // VL2_SETTINGS_H

@@ -15,6 +15,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pwd.h>
 #endif
 #ifdef _WIN32
 #include <windows.h>
@@ -374,9 +375,40 @@ static void appendOutbound(std::ostringstream& oss, const Profile& profile) {
     }
 }
 
-// ── TUN-mode config (xray v5 tun inbound) ─────────────────────────────────
-// Xray creates the virtual network interface itself when this config is used.
-// Requires root/administrator on most platforms.
+// ── TUN-mode config (xray tun inbound) ────────────────────────────────────
+// xray creates the virtual network interface itself.
+// NOTE: xray tun does NOT support autoRoute/strictRoute (those are sing-box
+// fields). Routing must be set up by the host OS after xray starts —
+// see setupTunRoutes() below.
+// ── Pick a TUN interface name suitable for the current OS ─────────────────
+// macOS: xray requires the format "utunN" (a number suffix), e.g. utun5.
+//        We auto-detect the highest existing utunN and use N+1.
+// Linux: any name works; "tun0" is conventional but we fall back to "vl2tun"
+//        if the user did not specify one.
+static std::string pickTunName(const std::string& userPref) {
+    if (!userPref.empty() && userPref != "auto") return userPref;
+
+#ifdef __APPLE__
+    // List existing utun interfaces and pick the next free number.
+    int maxN = -1;
+    FILE* p = popen("ifconfig 2>/dev/null | grep -oE '^utun[0-9]+' | sed 's/utun//'", "r");
+    if (p) {
+        char buf[16] = {0};
+        while (fgets(buf, sizeof(buf), p)) {
+            buf[strcspn(buf, "\n ")] = '\0';
+            if (buf[0]) {
+                int n = atoi(buf);
+                if (n > maxN) maxN = n;
+            }
+        }
+        pclose(p);
+    }
+    return "utun" + std::to_string(maxN + 1);
+#else
+    return "tun0";
+#endif
+}
+
 std::string generateTunConfig(const Profile& profile, const Settings& settings) {
     std::ostringstream oss;
 
@@ -384,7 +416,7 @@ std::string generateTunConfig(const Profile& profile, const Settings& settings) 
     std::string tunName  = (settings.tunInterface.empty() || settings.tunInterface == "auto")
                            ? "vl2-xray-tun" : settings.tunInterface;
 
-    // Build DNS list from settings
+    // DNS servers JSON array
     std::string dnsBlock;
     {
         std::istringstream dss(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
@@ -428,7 +460,7 @@ std::string generateTunConfig(const Profile& profile, const Settings& settings) 
         << "      },\n"
         << "      \"sniffing\": {\n"
         << "        \"enabled\": true,\n"
-        << "        \"destOverride\": [\"http\", \"tls\", \"quic\"]\n"
+        << "        \"destOverride\": [\"http\", \"tls\"]\n"
         << "      }\n"
         << "    }";
 
@@ -833,6 +865,453 @@ bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunne
 // Generates a TUN inbound config (xray v5+), writes it, and launches xray
 // with root/sudo so it can create the virtual network interface.
 // outIfaceName is populated with the interface name (e.g. "tun0", "utun5").
+// ── Extract server host from profile address (host:port) ──────────────────
+static std::string profileServerHost(const Profile& profile) {
+    size_t colon = profile.address.rfind(':');
+    if (colon != std::string::npos) return profile.address.substr(0, colon);
+    return profile.address;
+}
+
+// ── Resolve hostname to IP (needed for route add which requires IP) ────────
+static std::string resolveHostname(const std::string& host) {
+    // If already an IP, return as-is
+    bool isIp = true;
+    for (char c : host) {
+        if (!isdigit(c) && c != '.') { isIp = false; break; }
+    }
+    if (isIp && host.find('.') != std::string::npos) return host;
+
+    // Try dig first, then host, then nslookup
+    std::string cmd = "dig +short " + host + " A 2>/dev/null | grep -E '^[0-9]+\\.' | head -1";
+    FILE* p = popen(cmd.c_str(), "r");
+    char buf[64] = {0};
+    if (p) {
+        fgets(buf, sizeof(buf), p);
+        pclose(p);
+        buf[strcspn(buf, "\n ")] = '\0';
+        if (buf[0]) return buf;
+    }
+
+    // Fallback: getent hosts (Linux) / host command (macOS)
+    memset(buf, 0, sizeof(buf));
+    cmd = "host " + host + " 2>/dev/null | awk '/has address/{print $NF; exit}'";
+    p = popen(cmd.c_str(), "r");
+    if (p) {
+        fgets(buf, sizeof(buf), p);
+        pclose(p);
+        buf[strcspn(buf, "\n ")] = '\0';
+        if (buf[0]) return buf;
+    }
+
+    return {};  // resolution failed
+}
+
+// ── Check if we have internet connectivity through the tunnel ──────────────
+static bool testConnectivity() {
+#ifdef _WIN32
+    return system("ping -n 1 -w 3000 8.8.8.8 >nul 2>&1") == 0;
+#elif defined(__APPLE__)
+    return system("ping -c 1 -t 3 8.8.8.8 >/dev/null 2>&1") == 0;
+#else
+    return system("ping -c 1 -W 3 8.8.8.8 >/dev/null 2>&1") == 0;
+#endif
+}
+
+// ── Set up OS routing rules so traffic goes through the TUN interface ──────
+// Returns true if routes applied AND connectivity confirmed.
+// On failure, rolls back routes automatically.
+static bool setupTunRoutes(const std::string& ifaceName,
+                           const std::string& vpnServerHost,
+                           const Settings& settings) {
+#if defined(__APPLE__) || defined(__linux__)
+    // ── 1. Resolve VPN server hostname to IP ─────────────────────────────
+    std::string vpnIp;
+    if (!vpnServerHost.empty() && vpnServerHost != "invalid") {
+        std::cout << "  Resolving " << vpnServerHost << "... ";
+        std::cout.flush();
+        vpnIp = resolveHostname(vpnServerHost);
+        std::cout << (vpnIp.empty() ? "failed" : vpnIp) << "\n";
+    }
+#endif
+
+#ifdef __APPLE__
+    // ── 2. Read current default gateway & real interface ──────────────────
+    char gwBuf[64] = {0};
+    char ifBuf[32] = {0};
+    {
+        FILE* p = popen("route -n get default 2>/dev/null | awk '/gateway/{print $2}'", "r");
+        if (p) { fgets(gwBuf, sizeof(gwBuf), p); pclose(p); }
+        gwBuf[strcspn(gwBuf, "\n ")] = '\0';
+    }
+    {
+        FILE* p = popen("route -n get default 2>/dev/null | awk '/interface/{print $2}'", "r");
+        if (p) { fgets(ifBuf, sizeof(ifBuf), p); pclose(p); }
+        ifBuf[strcspn(ifBuf, "\n ")] = '\0';
+    }
+
+    if (!gwBuf[0]) {
+        std::cout << "  ERROR: cannot detect default gateway — aborting route setup\n";
+        return false;
+    }
+    std::cout << "  gateway=" << gwBuf << "  dev=" << ifBuf << "\n";
+
+    // Persist state for cleanup
+    { std::ofstream f("/tmp/vl2_tun_gw");     f << gwBuf; }
+    { std::ofstream f("/tmp/vl2_tun_if");     f << ifBuf; }
+    { std::ofstream f("/tmp/vl2_tun_server"); f << vpnIp;  }
+
+    // ── 3. Bypass route: VPN server → real interface (MUST be IP) ─────────
+    if (!vpnIp.empty()) {
+        std::string cmd = "sudo route add " + vpnIp + " " + std::string(gwBuf) + " 2>/dev/null";
+        system(cmd.c_str());
+    } else {
+        std::cout << "  WARNING: VPN server IP unknown — traffic may loop!\n";
+    }
+
+    // ── 4. Redirect all other traffic through TUN (two /1 cover all of /0) ─
+    system(("sudo route add 0.0.0.0/1   -interface " + ifaceName + " 2>/dev/null").c_str());
+    system(("sudo route add 128.0.0.0/1 -interface " + ifaceName + " 2>/dev/null").c_str());
+    if (settings.enableIPv6) {
+        system(("sudo route add -inet6 ::/1     -interface " + ifaceName + " 2>/dev/null").c_str());
+        system(("sudo route add -inet6 8000::/1 -interface " + ifaceName + " 2>/dev/null").c_str());
+    }
+
+    // ── 5. Set DNS ─────────────────────────────────────────────────────────
+    {
+        std::string dnsArgs;
+        std::istringstream d(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
+        std::string s;
+        while (std::getline(d, s, ',')) {
+            if (!s.empty()) dnsArgs += " " + s;
+        }
+        FILE* svcp = popen("networksetup -listallnetworkservices 2>/dev/null | tail -n +2", "r");
+        if (svcp) {
+            char svcBuf[128] = {0};
+            while (fgets(svcBuf, sizeof(svcBuf), svcp)) {
+                svcBuf[strcspn(svcBuf, "\n")] = '\0';
+                if (svcBuf[0] == '*' || svcBuf[0] == '\0') continue;
+                system(("sudo networksetup -setdnsservers '" + std::string(svcBuf) + "'" + dnsArgs + " 2>/dev/null").c_str());
+            }
+            pclose(svcp);
+        }
+    }
+
+    // ── 6. Connectivity test — rollback if broken ──────────────────────────
+    std::cout << "  Testing connectivity... ";
+    std::cout.flush();
+    usleep(1500000);  // give routes 1.5s to settle
+    if (!testConnectivity()) {
+        std::cout << "FAIL — rolling back routes!\n";
+        // Rollback
+        system(("sudo route delete 0.0.0.0/1   -interface " + ifaceName + " 2>/dev/null").c_str());
+        system(("sudo route delete 128.0.0.0/1 -interface " + ifaceName + " 2>/dev/null").c_str());
+        if (!vpnIp.empty())
+            system(("sudo route delete " + vpnIp + " 2>/dev/null").c_str());
+        // Restore DNS
+        FILE* svcp = popen("networksetup -listallnetworkservices 2>/dev/null | tail -n +2", "r");
+        if (svcp) {
+            char svcBuf[128] = {0};
+            while (fgets(svcBuf, sizeof(svcBuf), svcp)) {
+                svcBuf[strcspn(svcBuf, "\n")] = '\0';
+                if (svcBuf[0] == '*' || svcBuf[0] == '\0') continue;
+                system(("sudo networksetup -setdnsservers '" + std::string(svcBuf) + "' Empty 2>/dev/null").c_str());
+            }
+            pclose(svcp);
+        }
+        system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server");
+        return false;
+    }
+    std::cout << "OK\n";
+    return true;
+
+#elif defined(__linux__)
+    char gwBuf[64] = {0};
+    char ifBuf[32] = {0};
+    {
+        FILE* p = popen("ip route show default 2>/dev/null | awk 'NR==1{print $3}'", "r");
+        if (p) { fgets(gwBuf, sizeof(gwBuf), p); pclose(p); }
+        gwBuf[strcspn(gwBuf, "\n ")] = '\0';
+    }
+    {
+        FILE* p = popen("ip route show default 2>/dev/null | awk 'NR==1{print $5}'", "r");
+        if (p) { fgets(ifBuf, sizeof(ifBuf), p); pclose(p); }
+        ifBuf[strcspn(ifBuf, "\n ")] = '\0';
+    }
+
+    if (!gwBuf[0]) {
+        std::cout << "  ERROR: cannot detect default gateway — aborting\n";
+        return false;
+    }
+    std::cout << "  gateway=" << gwBuf << "  dev=" << ifBuf << "\n";
+
+    { std::ofstream f("/tmp/vl2_tun_gw");     f << gwBuf; }
+    { std::ofstream f("/tmp/vl2_tun_if");     f << ifBuf; }
+    { std::ofstream f("/tmp/vl2_tun_server"); f << vpnIp;  }
+
+    if (!vpnIp.empty()) {
+        system(("sudo ip route add " + vpnIp + " via " + std::string(gwBuf)
+                + " dev " + std::string(ifBuf) + " 2>/dev/null").c_str());
+    }
+
+    system(("sudo ip route add 0.0.0.0/1   dev " + ifaceName + " 2>/dev/null").c_str());
+    system(("sudo ip route add 128.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
+
+    // ── DNS: prefer systemd-resolved (Arch Linux), fallback to /etc/resolv.conf ──
+    // Detect whether resolvectl is available (systemd-resolved).
+    bool useResolvectl = (system("command -v resolvectl >/dev/null 2>&1") == 0);
+    { std::ofstream f("/tmp/vl2_tun_use_resolvectl"); f << (useResolvectl ? "1" : "0"); }
+
+    if (useResolvectl) {
+        // Apply DNS via resolvectl — works on Arch, Ubuntu 20+, etc.
+        std::istringstream d(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
+        std::string s;
+        std::string dnsArgs;
+        while (std::getline(d, s, ',')) {
+            if (!s.empty()) dnsArgs += " " + s;
+        }
+        system(("sudo resolvectl dns " + ifaceName + dnsArgs + " 2>/dev/null").c_str());
+        system(("sudo resolvectl domain " + ifaceName + " ~. 2>/dev/null").c_str());
+        // Tell systemd-resolved this link is the default DNS for all domains
+        system(("sudo resolvectl default-route " + ifaceName + " yes 2>/dev/null").c_str());
+    } else {
+        // Fallback: edit /etc/resolv.conf directly
+        system("sudo cp /etc/resolv.conf /tmp/vl2_resolv_backup 2>/dev/null");
+        {
+            std::ofstream rc("/tmp/vl2_resolv_new");
+            std::istringstream d(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
+            std::string s;
+            while (std::getline(d, s, ',')) {
+                if (!s.empty()) rc << "nameserver " << s << "\n";
+            }
+        }
+        system("sudo cp /tmp/vl2_resolv_new /etc/resolv.conf 2>/dev/null");
+    }
+
+    std::cout << "  Testing connectivity... ";
+    std::cout.flush();
+    usleep(1500000);
+    if (!testConnectivity()) {
+        std::cout << "FAIL — rolling back routes!\n";
+        system(("sudo ip route del 0.0.0.0/1   dev " + ifaceName + " 2>/dev/null").c_str());
+        system(("sudo ip route del 128.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
+        if (!vpnIp.empty())
+            system(("sudo ip route del " + vpnIp + " 2>/dev/null").c_str());
+        if (useResolvectl) {
+            system(("sudo resolvectl revert " + ifaceName + " 2>/dev/null").c_str());
+        } else {
+            system("sudo cp /tmp/vl2_resolv_backup /etc/resolv.conf 2>/dev/null");
+        }
+        system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server /tmp/vl2_tun_use_resolvectl");
+        return false;
+    }
+    std::cout << "OK\n";
+    return true;
+#elif defined(_WIN32)
+    // ── Windows: PowerShell Add-NetRoute ─────────────────────────────────────
+    // Interface name is always "vL2" (set in the xray config).
+    const std::string iface = "vL2";
+
+    // 1. Resolve VPN server hostname → IP (route add needs IP)
+    std::string vpnIp;
+    if (!vpnServerHost.empty() && vpnServerHost != "invalid") {
+        std::cout << "  Resolving " << vpnServerHost << "... ";
+        std::cout.flush();
+        // nslookup outputs "Address: x.x.x.x" for the answer
+        std::string nsCmd = "nslookup " + vpnServerHost + " 8.8.8.8 2>nul";
+        FILE* nsp = _popen(nsCmd.c_str(), "r");
+        if (nsp) {
+            char buf[256] = {0};
+            bool skip = true;   // skip the server/address lines for 8.8.8.8 itself
+            while (fgets(buf, sizeof(buf), nsp)) {
+                std::string line(buf);
+                if (line.find("Name:") != std::string::npos) { skip = false; continue; }
+                if (!skip && line.find("Address:") != std::string::npos) {
+                    size_t p = line.find(':');
+                    if (p != std::string::npos) {
+                        vpnIp = line.substr(p + 2);
+                        vpnIp.erase(vpnIp.find_last_not_of(" \t\r\n") + 1);
+                    }
+                    break;
+                }
+            }
+            _pclose(nsp);
+        }
+        std::cout << (vpnIp.empty() ? "failed" : vpnIp) << "\n";
+    }
+
+    // 2. Get current default gateway and interface
+    char gwBuf[64] = {0};
+    char ifIdxBuf[16] = {0};
+    {
+        FILE* p = _popen("powershell -Command \"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).NextHop\" 2>nul", "r");
+        if (p) { fgets(gwBuf, sizeof(gwBuf), p); _pclose(p); }
+        gwBuf[strcspn(gwBuf, "\r\n")] = '\0';
+    }
+    {
+        FILE* p = _popen("powershell -Command \"(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1).ifIndex\" 2>nul", "r");
+        if (p) { fgets(ifIdxBuf, sizeof(ifIdxBuf), p); _pclose(p); }
+        ifIdxBuf[strcspn(ifIdxBuf, "\r\n")] = '\0';
+    }
+
+    if (!gwBuf[0]) {
+        std::cout << "  ERROR: cannot detect default gateway\n";
+        return false;
+    }
+    std::cout << "  gateway=" << gwBuf << "  ifIndex=" << ifIdxBuf << "\n";
+
+    // Persist for cleanup
+    { std::ofstream f("C:\\vl2_tun_gw.txt");     f << gwBuf; }
+    { std::ofstream f("C:\\vl2_tun_ifidx.txt");  f << ifIdxBuf; }
+    { std::ofstream f("C:\\vl2_tun_server.txt"); f << vpnIp; }
+
+    // 3. Bypass route: VPN server → real gateway (must add BEFORE default route changes)
+    if (!vpnIp.empty() && gwBuf[0]) {
+        std::string cmd = "route add " + vpnIp + " " + std::string(gwBuf) + " metric 1 >nul 2>&1";
+        system(cmd.c_str());
+    } else {
+        std::cout << "  WARNING: VPN server IP unknown — may loop!\n";
+    }
+
+    // 4. Wait for vL2 interface to appear
+    std::cout << "  Waiting for vL2 interface... ";
+    std::cout.flush();
+    bool ifaceFound = false;
+    for (int i = 0; i < 8; ++i) {
+        Sleep(500);
+        FILE* chk = _popen("powershell -Command \"if (Get-NetAdapter -Name 'vL2' -ErrorAction SilentlyContinue) { 'found' }\" 2>nul", "r");
+        if (chk) {
+            char cb[16] = {0};
+            fgets(cb, sizeof(cb), chk);
+            _pclose(chk);
+            if (strstr(cb, "found")) { ifaceFound = true; break; }
+        }
+    }
+    std::cout << (ifaceFound ? "OK\n" : "not found (continuing anyway)\n");
+
+    // 5. Set interface description to "vL2 tun" via PowerShell
+    system("powershell -Command \"try { Set-NetAdapter -Name 'vL2' -Description 'vL2 tun' -Confirm:$false -ErrorAction Stop } catch {}\" >nul 2>&1");
+
+    // 6. Route all traffic through vL2 (two /1 cover all of /0)
+    system("powershell -Command \"Remove-NetRoute -DestinationPrefix '0.0.0.0/1'   -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+    system("powershell -Command \"Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+    system("powershell -Command \"New-NetRoute -DestinationPrefix '0.0.0.0/1'   -InterfaceAlias 'vL2' -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore\" >nul 2>&1");
+    system("powershell -Command \"New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceAlias 'vL2' -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore\" >nul 2>&1");
+
+    // 7. Set DNS on vL2 interface
+    {
+        std::string dnsArgs;
+        std::istringstream d(settings.dnsServers.empty() ? "8.8.8.8,1.1.1.1" : settings.dnsServers);
+        std::string s;
+        bool first = true;
+        while (std::getline(d, s, ',')) {
+            if (s.empty()) continue;
+            if (first) {
+                system(("netsh interface ip set dns name=\"vL2\" static " + s + " primary >nul 2>&1").c_str());
+                first = false;
+            } else {
+                system(("netsh interface ip add dns name=\"vL2\" " + s + " index=2 >nul 2>&1").c_str());
+            }
+        }
+        // Also set DNS on all other adapters to avoid leaks
+        system(("powershell -Command \"Get-NetAdapter | Where-Object {$_.Name -ne 'vL2' -and $_.Status -eq 'Up'} | ForEach-Object { Set-DnsClientServerAddress -InterfaceAlias $_.Name -ServerAddresses '" + (settings.dnsServers.empty() ? "8.8.8.8" : settings.dnsServers.substr(0, settings.dnsServers.find(','))) + "' }\" >nul 2>&1").c_str());
+    }
+
+    // 8. Flush DNS cache
+    system("ipconfig /flushdns >nul 2>&1");
+
+    // 9. Connectivity test
+    std::cout << "  Testing connectivity... ";
+    std::cout.flush();
+    Sleep(2000);
+    if (!testConnectivity()) {
+        std::cout << "FAIL — rolling back!\n";
+        system("powershell -Command \"Remove-NetRoute -DestinationPrefix '0.0.0.0/1'   -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+        system("powershell -Command \"Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+        if (!vpnIp.empty()) {
+            system(("route delete " + vpnIp + " >nul 2>&1").c_str());
+        }
+        system("powershell -Command \"Get-NetAdapter | ForEach-Object { Set-DnsClientServerAddress -InterfaceAlias $_.Name -ResetServerAddresses }\" >nul 2>&1");
+        system("ipconfig /flushdns >nul 2>&1");
+        system("del /f C:\\vl2_tun_gw.txt C:\\vl2_tun_ifidx.txt C:\\vl2_tun_server.txt >nul 2>&1");
+        return false;
+    }
+    std::cout << "OK\n";
+    return true;
+
+#else
+    (void)ifaceName; (void)vpnServerHost; (void)settings;
+    return false;
+#endif
+}
+
+// ── Restore routes and DNS set by setupTunRoutes() ─────────────────────────
+static void cleanupTunRoutes(const std::string& ifaceName) {
+#ifdef __APPLE__
+    // Restore VPN server specific route
+    std::string vpnServer;
+    { std::ifstream f("/tmp/vl2_tun_server"); f >> vpnServer; }
+    if (!vpnServer.empty()) {
+        system(("sudo route delete " + vpnServer + " 2>/dev/null").c_str());
+    }
+
+    // Remove the two /1 routes
+    system(("sudo route delete 0.0.0.0/1   -interface " + ifaceName + " 2>/dev/null").c_str());
+    system(("sudo route delete 128.0.0.0/1 -interface " + ifaceName + " 2>/dev/null").c_str());
+    system("sudo route delete -inet6 ::/1     2>/dev/null");
+    system("sudo route delete -inet6 8000::/1 2>/dev/null");
+
+    // Restore DNS — set all services back to "Empty" (DHCP-assigned)
+    FILE* svcp = popen("networksetup -listallnetworkservices 2>/dev/null | tail -n +2", "r");
+    if (svcp) {
+        char svcBuf[128] = {0};
+        while (fgets(svcBuf, sizeof(svcBuf), svcp)) {
+            svcBuf[strcspn(svcBuf, "\n")] = '\0';
+            if (svcBuf[0] == '*') continue;
+            system(("sudo networksetup -setdnsservers '" + std::string(svcBuf) + "' Empty 2>/dev/null").c_str());
+        }
+        pclose(svcp);
+    }
+    system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server /tmp/vl2_tun_dns_backup");
+
+#elif defined(__linux__)
+    std::string vpnServer;
+    { std::ifstream f("/tmp/vl2_tun_server"); f >> vpnServer; }
+
+    system(("sudo ip route del 0.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
+    system(("sudo ip route del 128.0.0.0/1 dev " + ifaceName + " 2>/dev/null").c_str());
+    if (!vpnServer.empty()) {
+        system(("sudo ip route del " + vpnServer + " 2>/dev/null").c_str());
+    }
+
+    // Restore DNS: prefer resolvectl if it was used during setup
+    std::string useRc;
+    { std::ifstream f("/tmp/vl2_tun_use_resolvectl"); f >> useRc; }
+    if (useRc == "1") {
+        system(("sudo resolvectl revert " + ifaceName + " 2>/dev/null").c_str());
+    } else {
+        system("sudo cp /tmp/vl2_resolv_backup /etc/resolv.conf 2>/dev/null");
+    }
+    system("rm -f /tmp/vl2_tun_gw /tmp/vl2_tun_if /tmp/vl2_tun_server /tmp/vl2_resolv_backup /tmp/vl2_resolv_new /tmp/vl2_tun_use_resolvectl");
+
+#elif defined(_WIN32)
+    (void)ifaceName;
+    std::string vpnIp;
+    { std::ifstream f("C:\\vl2_tun_server.txt"); f >> vpnIp; }
+
+    // Remove the two /1 routes
+    system("powershell -Command \"Remove-NetRoute -DestinationPrefix '0.0.0.0/1'   -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+    system("powershell -Command \"Remove-NetRoute -DestinationPrefix '128.0.0.0/1' -Confirm:$false -ErrorAction SilentlyContinue\" >nul 2>&1");
+    // Remove bypass route for VPN server
+    if (!vpnIp.empty()) {
+        system(("route delete " + vpnIp + " >nul 2>&1").c_str());
+    }
+    // Restore DNS to DHCP on all adapters
+    system("powershell -Command \"Get-NetAdapter | ForEach-Object { Set-DnsClientServerAddress -InterfaceAlias $_.Name -ResetServerAddresses }\" >nul 2>&1");
+    system("ipconfig /flushdns >nul 2>&1");
+    system("del /f C:\\vl2_tun_gw.txt C:\\vl2_tun_ifidx.txt C:\\vl2_tun_server.txt >nul 2>&1");
+#endif
+}
+
 bool launchXrayTun(const Settings& settings, const Profile& profile,
                    std::string& outLogFile, std::string& outIfaceName, ProcessId& outPid) {
     clearScreen();
@@ -849,8 +1328,15 @@ bool launchXrayTun(const Settings& settings, const Profile& profile,
     }
     std::cout << tr(lang, "Binary: ", "Бинарник: ") << binaryPath << "\n";
 
+    // Resolve TUN interface name BEFORE generating config so we know what to wait for.
+    // pickTunName() auto-detects the next free utunN on macOS, tun0 on Linux.
+    // We store it into a local copy of settings so generateTunConfig uses the same name.
+    Settings settingsForTun = settings;
+    settingsForTun.tunInterface = pickTunName(settings.tunInterface);
+    std::cout << tr(lang, "TUN interface will be: ", "Имя TUN интерфейса: ") << settingsForTun.tunInterface << "\n";
+
     // Generate TUN config
-    std::string config = generateTunConfig(profile, settings);
+    std::string config = generateTunConfig(profile, settingsForTun);
     std::ofstream configFile("config_tun.json");
     if (!configFile) {
         std::cout << tr(lang, "Failed to create config_tun.json", "Не удалось создать config_tun.json") << "\n";
@@ -893,40 +1379,61 @@ bool launchXrayTun(const Settings& settings, const Profile& profile,
         return false;
     }
 
-    // Wait a moment for xray to create the interface
+    // Wait for xray to bring up the interface we expect.
+    const std::string& expectedIface = settingsForTun.tunInterface;
     std::cout << tr(lang, "Waiting for TUN interface to come up...", "Ожидание поднятия TUN интерфейса...") << "\n";
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 8; ++i) {
         usleep(800000);  // 0.8 s per iteration
-        // Detect created interface name from the log
 #ifdef __APPLE__
-        FILE* ifPipe = popen("ifconfig 2>/dev/null | grep -E '^utun[0-9]+:' | tail -1 | cut -d: -f1", "r");
+        std::string checkCmd = "ifconfig " + expectedIface + " >/dev/null 2>&1";
 #else
-        FILE* ifPipe = popen("ip link 2>/dev/null | grep -oE 'tun[0-9]+' | tail -1", "r");
+        std::string checkCmd = "ip link show " + expectedIface + " >/dev/null 2>&1";
 #endif
-        if (ifPipe) {
-            char ifBuf[32] = {0};
-            if (fgets(ifBuf, sizeof(ifBuf), ifPipe)) {
-                ifBuf[strcspn(ifBuf, "\n ")] = '\0';
-                if (ifBuf[0] != '\0') {
-                    outIfaceName = ifBuf;
-                }
-            }
-            pclose(ifPipe);
+        if (system(checkCmd.c_str()) == 0) {
+            outIfaceName = expectedIface;
+            break;
         }
-        if (!outIfaceName.empty()) break;
     }
 
-    if (outIfaceName.empty()) outIfaceName = "tun?";  // fallback display label
+    if (outIfaceName.empty()) {
+        outIfaceName = expectedIface;  // use expected name anyway, routes may still work
+        std::cout << tr(lang,
+            "WARNING: interface not detected yet, continuing...",
+            "ПРЕДУПРЕЖДЕНИЕ: интерфейс ещё не обнаружен, продолжаем...") << "\n";
+    }
 
     std::cout << tr(lang, "TUN interface: ", "TUN интерфейс: ") << outIfaceName << "\n";
-    std::cout << tr(lang, "Tunnel subnet: ", "Подсеть туннеля: ") << settings.tunnelSubnet << "\n";
+    std::cout << tr(lang, "Tunnel subnet: ", "Подсеть туннеля: ") << settingsForTun.tunnelSubnet << "\n";
+
+    // ── Set up OS routing rules ────────────────────────────────────────────
+    std::cout << tr(lang,
+        "Setting up routing rules (hostname will be resolved to IP)...",
+        "Настройка маршрутов (хостнейм будет разрешён в IP)...") << "\n";
+    std::string vpnServer = profileServerHost(profile);
+    bool routesOk = setupTunRoutes(outIfaceName, vpnServer, settingsForTun);
+    if (!routesOk) {
+        std::cout << "\n" << tr(lang,
+            "Route setup failed or connectivity test failed — routes rolled back.\n"
+            "xray is still running as SOCKS5 proxy on 127.0.0.1:",
+            "Маршруты не применены или тест связи провалился — откат выполнен.\n"
+            "xray продолжает работать как SOCKS5 прокси на 127.0.0.1:")
+            << settings.proxyPort << "\n";
+        std::cout << tr(lang,
+            "Check xray-tun.log for errors.",
+            "Проверьте xray-tun.log для диагностики.") << "\n";
+        // Show last lines of log
+        system(("tail -20 " + outLogFile).c_str());
+    } else {
+        std::cout << tr(lang, "Routes configured. Tunnel is active.", "Маршруты настроены. Туннель активен.") << "\n";
+    }
+
     if (settings.proxyPort > 0) {
-        std::cout << tr(lang, "SOCKS5 also available on: ", "SOCKS5 также доступен на: ")
+        std::cout << tr(lang, "SOCKS5 also on: ", "SOCKS5 также на: ")
                   << "127.0.0.1:" << settings.proxyPort << "\n";
     }
     if (settings.killSwitch) {
         std::cout << tr(lang,
-            "[kill-switch ON] Traffic is blocked if tunnel drops.",
+            "[kill-switch ON] Traffic blocked if tunnel drops.",
             "[kill-switch ВКЛ] Трафик блокируется при обрыве туннеля.") << "\n";
     }
 
@@ -1208,26 +1715,31 @@ bool launchXrayTun(const Settings& settings, const Profile& profile,
 // ── Cleanup for TUN mode ───────────────────────────────────────────────────
 bool cleanupTunVPN(const Settings& settings) {
     Language lang = settings.language;
-    std::cout << tr(lang, "Removing TUN interface and routing rules...",
-                         "Удаление TUN интерфейса и правил маршрутизации...") << "\n";
+    std::cout << tr(lang, "Removing TUN routing rules...",
+                         "Удаление правил маршрутизации TUN...") << "\n";
+#if defined(__APPLE__) || defined(__linux__)
+    // Read back interface name from what was detected at launch time.
+    // We pass "tun?" as fallback — cleanupTunRoutes will still try.
+    std::string ifaceName;
+    {
+        // Try to detect current utun/tun interface
 #ifdef __APPLE__
-    // utun interfaces are automatically removed when xray process exits.
-    // Flush any pf rules we may have set.
-    system("sudo pfctl -F rules 2>/dev/null");
-    system("sudo pfctl -F nat  2>/dev/null");
-    system("sudo pfctl -d      2>/dev/null");
-    std::cout << tr(lang, "macOS: utun interface released.", "macOS: utun интерфейс освобождён.") << "\n";
-#elif defined(__linux__)
-    // On Linux, the tun0 interface is held by the xray process.
-    // After xray is killed, we clean up any leftover routes.
-    system("sudo ip route del default dev tun0 2>/dev/null");
-    system("sudo ip link delete tun0 2>/dev/null");
-    // Restore previous iptables state if we saved it
-    if (std::ifstream("/tmp/vl2_iptables_backup")) {
-        system("sudo iptables-restore < /tmp/vl2_iptables_backup 2>/dev/null");
-        system("rm -f /tmp/vl2_iptables_backup");
+        FILE* p = popen("ifconfig 2>/dev/null | grep -E '^utun[0-9]+:' | tail -1 | cut -d: -f1", "r");
+#else
+        FILE* p = popen("ip link 2>/dev/null | grep -oE 'tun[0-9]+' | tail -1", "r");
+#endif
+        if (p) {
+            char buf[32] = {0};
+            if (fgets(buf, sizeof(buf), p)) {
+                buf[strcspn(buf, "\n ")] = '\0';
+                ifaceName = buf;
+            }
+            pclose(p);
+        }
     }
-    std::cout << tr(lang, "Linux: TUN interface released.", "Linux: TUN интерфейс освобождён.") << "\n";
+    if (ifaceName.empty()) ifaceName = "tun0";
+    cleanupTunRoutes(ifaceName);
+    std::cout << tr(lang, "Routes restored.", "Маршруты восстановлены.") << "\n";
 #elif defined(_WIN32)
     // Remove the split-default routes we added when the tunnel started.
     system("route delete 0.0.0.0 mask 128.0.0.0 >nul 2>&1");
@@ -1601,4 +2113,465 @@ bool downloadXrayCore(const Settings& settings) {
         "Xray-core binary not found after extraction. Check the xray/ folder manually.",
         "Бинарник xray-core не найден после распаковки. Проверьте папку xray/ вручную.") << "\n";
     return false;
+}
+
+// ── Per-app proxy helpers ──────────────────────────────────────────────────
+
+bool isProxychainsAvailable() {
+#if defined(__unix__) || defined(__APPLE__)
+    return system("command -v proxychains4 >/dev/null 2>&1") == 0
+        || system("command -v proxychains  >/dev/null 2>&1") == 0;
+#else
+    return false;
+#endif
+}
+
+std::string writeProxychainsConfig(int proxyPort) {
+    const std::string cfgPath = "/tmp/vl2_proxychains.conf";
+    std::ofstream cfg(cfgPath);
+    cfg << "strict_chain\n"
+        << "proxy_dns\n"
+        << "tcp_read_time_out 15000\n"
+        << "tcp_connect_time_out 8000\n"
+        << "[ProxyList]\n"
+        << "socks5 127.0.0.1 " << proxyPort << "\n";
+    return cfgPath;
+}
+
+// ── Detect Electron/Chromium-based apps ───────────────────────────────────
+// These apps ignore HTTP_PROXY env-vars and require --proxy-server CLI flag.
+static bool isElectronApp(const std::string& cmd) {
+    static const std::vector<std::string> knownElectron = {
+        "discord", "telegram", "telegram-desktop", "slack", "teams",
+        "code", "vscode", "vscodium", "atom", "notion", "obsidian",
+        "spotify", "skype", "viber", "element", "electron", "chromium",
+        "chrome", "brave", "opera"
+    };
+    std::string lower = cmd;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    for (const auto& name : knownElectron)
+        if (lower.find(name) != std::string::npos) return true;
+    return false;
+}
+
+// Resolve a bare command word ("discord") to its full path ("/usr/bin/discord").
+static std::string resolveBin(const std::string& word) {
+    if (word.empty() || word[0] == '/' || word[0] == '.') return word;
+    FILE* p = popen(("command -v " + word + " 2>/dev/null").c_str(), "r");
+    if (!p) return word;
+    char buf[512] = {0};
+    fgets(buf, sizeof(buf), p);
+    pclose(p);
+    buf[strcspn(buf, "\n ")] = '\0';
+    return buf[0] ? std::string(buf) : word;
+}
+
+void launchAppThroughProxy(const std::string& command, int proxyPort,
+                           int httpProxyPort, Language lang) {
+#if defined(__unix__) || defined(__APPLE__)
+    clearScreen();
+    std::cout << "=== " << tr(lang, "Launch app through proxy", "Запуск приложения через прокси") << " ===\n\n";
+    std::cout << tr(lang, "Command: ", "Команда: ") << command << "\n";
+    std::cout << tr(lang, "SOCKS5:  127.0.0.1:", "SOCKS5:  127.0.0.1:") << proxyPort << "\n\n";
+
+    // ── Per-app log file ───────────────────────────────────────────────────
+    std::string appWord = command.substr(0, command.find(' '));
+    appWord = appWord.substr(appWord.rfind('/') + 1);
+    std::string logFile = "/tmp/vl2_app_" + appWord + ".log";
+
+    std::string launchCmd;
+    bool electron = isElectronApp(command);
+
+    if (electron) {
+        // ── Electron / Chromium ────────────────────────────────────────────
+        // Split binary and extra args
+        size_t sp = command.find(' ');
+        std::string binWord  = command.substr(0, sp);
+        std::string restArgs = (sp != std::string::npos) ? command.substr(sp) : "";
+
+        std::string resolvedBin = resolveBin(binWord);
+
+        std::string proxyFlag = "--proxy-server=socks5://127.0.0.1:" + std::to_string(proxyPort);
+
+        std::cout << tr(lang,
+            "Electron app detected — injecting --proxy-server flag.\n",
+            "Обнаружено Electron-приложение — добавляется --proxy-server.\n");
+
+        launchCmd = "nohup \"" + resolvedBin + "\" " + proxyFlag + restArgs
+                    + " >\"" + logFile + "\" 2>&1 &";
+
+    } else if (isProxychainsAvailable()) {
+        // ── proxychains: intercepts all TCP syscalls ───────────────────────
+        std::string cfgPath = writeProxychainsConfig(proxyPort);
+        bool has4 = (system("command -v proxychains4 >/dev/null 2>&1") == 0);
+        std::string pchains = has4 ? "proxychains4" : "proxychains";
+
+        std::cout << tr(lang,
+            "Using proxychains — all TCP from this app goes through proxy.\n",
+            "Используется proxychains — весь TCP приложения идёт через прокси.\n");
+
+        launchCmd = "nohup " + pchains + " -f \"" + cfgPath + "\" " + command
+                    + " >\"" + logFile + "\" 2>&1 &";
+    } else {
+        // ── Env-var fallback ───────────────────────────────────────────────
+        std::string socksUrl = "socks5://127.0.0.1:" + std::to_string(proxyPort);
+        std::string httpUrl  = httpProxyPort > 0
+            ? ("http://127.0.0.1:" + std::to_string(httpProxyPort))
+            : ("http://127.0.0.1:" + std::to_string(proxyPort));
+
+        std::cout << tr(lang,
+            "Using proxy env-vars (HTTP_PROXY / ALL_PROXY).\n"
+            "  For Electron apps (Discord etc.) this may not work — they need proxychains.\n"
+            "  Install: pacman -S proxychains-ng\n",
+            "Используются переменные окружения прокси (HTTP_PROXY / ALL_PROXY).\n"
+            "  Для Electron-приложений (Discord и т.д.) нужен proxychains.\n"
+            "  Установка: pacman -S proxychains-ng\n");
+
+        launchCmd = "nohup env"
+                    " ALL_PROXY="   + socksUrl + " all_proxy="   + socksUrl +
+                    " HTTP_PROXY="  + httpUrl  + " http_proxy="  + httpUrl  +
+                    " HTTPS_PROXY=" + httpUrl  + " https_proxy=" + httpUrl  +
+                    " " + command + " >\"" + logFile + "\" 2>&1 &";
+    }
+
+    std::cout << tr(lang, "Launching...", "Запуск...") << "\n";
+    int ret = system(launchCmd.c_str());
+
+    if (ret == 0) {
+        std::cout << tr(lang, "App started in background.\n", "Приложение запущено в фоне.\n");
+        std::cout << tr(lang, "Log: ", "Лог: ") << logFile << "\n";
+        usleep(1200000); // wait 1.2s for app to produce initial output
+        std::cout << "\n--- " << tr(lang, "last output:", "последний вывод:") << " ---\n";
+        system(("tail -8 \"" + logFile + "\" 2>/dev/null || echo '(no output yet)'").c_str());
+        std::cout << "---\n";
+    } else {
+        std::cout << tr(lang, "Launch returned error. Log:\n", "Запуск вернул ошибку. Лог:\n");
+        system(("cat \"" + logFile + "\" 2>/dev/null").c_str());
+    }
+    pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+#else
+    (void)command; (void)proxyPort; (void)httpProxyPort;
+    clearScreen();
+    std::cout << tr(lang,
+        "Per-app proxy is not supported on Windows in this build.\n"
+        "Use system proxy settings or a tool like Proxifier.",
+        "Прокси для отдельных приложений не поддерживается в Windows в этой сборке.\n"
+        "Используйте системные настройки прокси или программу Proxifier.") << "\n";
+    pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+#endif
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// VPN NAMESPACE MODE  (Linux only)
+//
+// Creates an isolated network namespace (vl2ns) where ALL TCP/UDP traffic
+// from any app is forced through xray's SOCKS5 proxy via tun2socks.
+// Unlike the proxy env-var approach, this works for every app — including
+// those that ignore HTTP_PROXY (Discord, games, custom binaries, etc.).
+//
+// Architecture:
+//   main netns         vl2ns
+//   ──────────         ─────────────────────────────────────────
+//   xray SOCKS5  ←──  veth10200.0.1  ←── tun2socks ←── vl2tun
+//   0.0.0.0:1080       10.200.0.2                          ↑
+//                                               all app TCP/UDP
+//
+// Requirements: iproute2, tun2socks, iptables
+//   sudo pacman -S iproute2 tun2socks iptables
+// ═══════════════════════════════════════════════════════════════════════════
+
+static const std::string NS_NAME    = "vl2ns";
+static const std::string NS_VETH_H  = "vl2h";   // host side
+static const std::string NS_VETH_N  = "vl2n";   // namespace side
+static const std::string NS_HOST_IP = "10.200.0.1";
+static const std::string NS_NS_IP   = "10.200.0.2";
+static const std::string NS_SUBNET  = "10.200.0.0/24";
+static const std::string NS_TUN     = "vl2tun";
+
+bool isNetNSModeAvailable() {
+#ifdef __linux__
+    return system("command -v ip        >/dev/null 2>&1") == 0 &&
+           system("command -v tun2socks >/dev/null 2>&1") == 0;
+#else
+    return false;
+#endif
+}
+
+// ── Generate xray SOCKS5 config that binds to ALL interfaces ───────────────
+// Needed so xray is reachable at 10.200.0.1:<port> from inside the namespace.
+std::string generateNetNSSocksConfig(const Profile& profile, const Settings& settings) {
+    std::ostringstream oss;
+    int port = settings.proxyPort > 0 ? settings.proxyPort : 1080;
+
+    auto logLevelStr = [&]() -> std::string {
+        switch (settings.logLevel) {
+            case 1: return "debug"; case 2: return "info";
+            case 3: return "warning"; case 4: return "error";
+            case 5: return "none"; default: return "warning";
+        }
+    }();
+
+    oss << "{\n"
+        << "  \"log\": { \"loglevel\": \"" << logLevelStr << "\" },\n"
+        << "  \"inbounds\": [{\n"
+        << "    \"port\": " << port << ",\n"
+        << "    \"listen\": \"0.0.0.0\",\n"   // ← all interfaces
+        << "    \"protocol\": \"socks\",\n"
+        << "    \"settings\": { \"auth\": \"noauth\" },\n"
+        << "    \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] }\n"
+        << "  }],\n"
+        << "  \"outbounds\": [{\n"
+        << "    \"tag\": \"proxy\",\n";
+    appendOutbound(oss, profile);
+    oss << "\n  },{\n"
+        << "    \"tag\": \"direct\",\n"
+        << "    \"protocol\": \"freedom\",\n"
+        << "    \"settings\": {}\n"
+        << "  }],\n"
+        << "  \"routing\": {\n"
+        << "    \"domainStrategy\": \"IPIfNonMatch\",\n"
+        << "    \"rules\": [{\n"
+        << "      \"type\": \"field\",\n"
+        << "      \"ip\": [\"geoip:private\"],\n"
+        << "      \"outboundTag\": \"direct\"\n"
+        << "    }]\n"
+        << "  }\n"
+        << "}\n";
+    return oss.str();
+}
+
+// ── Start xray SOCKS5 listening on 0.0.0.0 for netns mode ─────────────────
+bool launchXrayCoreForNetNS(const Settings& settings, const Profile& profile,
+                            std::string& outLogFile, ProcessId& outPid) {
+#if defined(__unix__) || defined(__APPLE__)
+    std::string binaryPath = findXrayCoreBinary(settings);
+    if (binaryPath.empty()) return false;
+
+    std::string config = generateNetNSSocksConfig(profile, settings);
+    std::ofstream cf("config_netns.json");
+    if (!cf) return false;
+    cf << config;
+    cf.close();
+
+    outLogFile = "xray-netns.log";
+    std::string cmd = "nohup \"" + binaryPath + "\" -config config_netns.json >"
+                    + outLogFile + " 2>&1 & echo $!";
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return false;
+    char buf[32] = {0};
+    fgets(buf, sizeof(buf), p);
+    pclose(p);
+    outPid = strtol(buf, nullptr, 10);
+    return outPid > 0;
+#else
+    (void)settings; (void)profile; (void)outLogFile; (void)outPid;
+    return false;
+#endif
+}
+
+// ── Get current (non-root) username ───────────────────────────────────────
+#ifdef __linux__
+static std::string getCurrentUser() {
+    const char* u = getenv("SUDO_USER");
+    if (u && u[0]) return u;
+    u = getenv("USER");
+    if (u && u[0]) return u;
+    struct passwd* pw = getpwuid(getuid());
+    if (pw) return pw->pw_name;
+    return "";
+}
+#endif
+
+// ── Create the VPN network namespace and start tun2socks ───────────────────
+bool setupAppNetNS(int socksPort, Language lang) {
+#ifdef __linux__
+    std::cout << tr(lang,
+        "Setting up VPN network namespace (requires sudo)...\n",
+        "Настройка VPN сетевого пространства имён (требует sudo)...\n");
+
+    // Tear down any previous state
+    system(("sudo ip netns del " + NS_NAME + " 2>/dev/null").c_str());
+    system(("sudo ip link del " + NS_VETH_H + " 2>/dev/null").c_str());
+    usleep(200000);
+
+    // 1. Create network namespace
+    if (system(("sudo ip netns add " + NS_NAME).c_str()) != 0) {
+        std::cout << tr(lang,
+            "ERROR: cannot create network namespace. Is iproute2 installed and are you running with sudo?\n",
+            "ОШИБКА: не удалось создать сетевое пространство имён. Установлен ли iproute2 и запущено ли с sudo?\n");
+        return false;
+    }
+
+    // 2. veth pair: vl2h (host) ↔ vl2n (namespace)
+    system(("sudo ip link add " + NS_VETH_H + " type veth peer name " + NS_VETH_N).c_str());
+    system(("sudo ip link set " + NS_VETH_N + " netns " + NS_NAME).c_str());
+
+    // 3. Configure host side of veth
+    system(("sudo ip addr add " + NS_HOST_IP + "/24 dev " + NS_VETH_H).c_str());
+    system(("sudo ip link set " + NS_VETH_H + " up").c_str());
+
+    // 4. Configure namespace side of veth
+    auto ns = [](const std::string& cmd) {
+        system(("sudo ip netns exec " + NS_NAME + " " + cmd).c_str());
+    };
+    ns("ip addr add " + NS_NS_IP + "/24 dev " + NS_VETH_N);
+    ns("ip link set " + NS_VETH_N + " up");
+    ns("ip link set lo up");
+
+    // 5. IP forwarding on host so namespace traffic can reach xray
+    system("sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1");
+    system(("sudo iptables -t nat -A POSTROUTING -s " + NS_SUBNET + " -j MASQUERADE 2>/dev/null").c_str());
+
+    // 6. DNS for namespace via /etc/netns/<name>/resolv.conf
+    //    (ip netns exec reads this file automatically when looking up names)
+    system(("sudo mkdir -p /etc/netns/" + NS_NAME).c_str());
+    {
+        std::ofstream rc("/tmp/vl2_ns_resolv.conf");
+        rc << "nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
+    }
+    system(("sudo cp /tmp/vl2_ns_resolv.conf /etc/netns/" + NS_NAME + "/resolv.conf").c_str());
+
+    // 7. TUN device inside namespace (tun2socks will use this)
+    ns("ip tuntap add mode tun name " + NS_TUN);
+    ns("ip addr add 198.18.0.1/15 dev " + NS_TUN);   // tun2socks default range
+    ns("ip link set " + NS_TUN + " up");
+
+    // 8. Routing inside namespace:
+    //    - veth route (10.200.0.0/24) stays direct → reach xray on host
+    //    - everything else → through TUN (tun2socks handles it)
+    ns("ip route add default dev " + NS_TUN);
+
+    // 9. Start tun2socks inside the namespace.
+    //    It reads from vl2tun and forwards all TCP/UDP via SOCKS5 to xray.
+    //    xray listens on 0.0.0.0:port so it's reachable at 10.200.0.1:port.
+    std::string t2sCmd =
+        "sudo ip netns exec " + NS_NAME + " tun2socks"
+        " -device "  + NS_TUN +
+        " -proxy socks5://" + NS_HOST_IP + ":" + std::to_string(socksPort) +
+        " -loglevel error"
+        " >/tmp/vl2_tun2socks.log 2>&1 &";
+
+    std::cout << tr(lang, "Starting tun2socks... ", "Запуск tun2socks... ");
+    std::cout.flush();
+    system(t2sCmd.c_str());
+    usleep(1500000);   // let tun2socks initialise
+
+    // 10. Quick connectivity test from inside the namespace
+    int testRet = system(("sudo ip netns exec " + NS_NAME +
+                          " ping -c 1 -W 4 8.8.8.8 >/dev/null 2>&1").c_str());
+    if (testRet != 0) {
+        std::cout << tr(lang, "FAIL\n", "ОШИБКА\n");
+        std::cout << tr(lang,
+            "Connectivity test failed. tun2socks log:\n",
+            "Тест соединения не прошёл. Лог tun2socks:\n");
+        system("tail -15 /tmp/vl2_tun2socks.log 2>/dev/null");
+        std::cout << tr(lang,
+            "\nNamespace is still set up — app may work even without ping.\n",
+            "\nПространство имён всё ещё создано — приложение может работать несмотря на ошибку ping.\n");
+    } else {
+        std::cout << tr(lang, "OK\n", "OK\n");
+    }
+
+    // Save port for cleanup reference
+    { std::ofstream f("/tmp/vl2_netns_port"); f << socksPort; }
+
+    std::cout << tr(lang,
+        "VPN namespace ready. ALL traffic from apps launched here goes through VLESS+Reality.\n",
+        "VPN пространство имён готово. ВЕСЬ трафик запущенных приложений идёт через VLESS+Reality.\n");
+    return true;
+#else
+    (void)socksPort; (void)lang;
+    return false;
+#endif
+}
+
+// ── Tear down the VPN namespace ────────────────────────────────────────────
+void cleanupAppNetNS() {
+#ifdef __linux__
+    // Kill tun2socks
+    system(("sudo ip netns exec " + NS_NAME + " pkill tun2socks 2>/dev/null").c_str());
+    usleep(300000);
+
+    // iptables cleanup
+    system(("sudo iptables -t nat -D POSTROUTING -s " + NS_SUBNET + " -j MASQUERADE 2>/dev/null").c_str());
+
+    // Delete namespace (also removes the veth peer inside it)
+    system(("sudo ip netns del " + NS_NAME + " 2>/dev/null").c_str());
+    // Remove host-side veth (may already be gone when namespace was deleted)
+    system(("sudo ip link del " + NS_VETH_H + " 2>/dev/null").c_str());
+
+    // Remove DNS override
+    system(("sudo rm -rf /etc/netns/" + NS_NAME).c_str());
+    system("rm -f /tmp/vl2_netns_port /tmp/vl2_ns_resolv.conf /tmp/vl2_tun2socks.log");
+#endif
+}
+
+// ── Launch an app inside the VPN namespace as the current user ────────────
+bool launchAppInNetNS(const std::string& command, Language lang) {
+#ifdef __linux__
+    clearScreen();
+    std::cout << "=== " << tr(lang, "Launch in VPN namespace", "Запуск в VPN пространстве имён") << " ===\n\n";
+    std::cout << tr(lang, "Command: ", "Команда: ") << command << "\n";
+    std::cout << tr(lang,
+        "ALL traffic from this app goes through VLESS+Reality.\n\n",
+        "ВЕСЬ трафик этого приложения идёт через VLESS+Reality.\n\n");
+
+    std::string user = getCurrentUser();
+    if (user.empty()) {
+        std::cout << tr(lang,
+            "ERROR: cannot determine current user.\n",
+            "ОШИБКА: не удалось определить текущего пользователя.\n");
+        pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
+        return false;
+    }
+
+    // Collect display/session env vars so GUI apps work from inside netns.
+    // Filesystem (X11/Wayland sockets) is shared — only network is isolated.
+    std::string envStr;
+    auto addEnv = [&](const char* var) {
+        const char* v = getenv(var);
+        if (v && v[0]) {
+            envStr += std::string(var) + "='" + v + "' ";
+        }
+    };
+    addEnv("DISPLAY");
+    addEnv("WAYLAND_DISPLAY");
+    addEnv("XDG_RUNTIME_DIR");
+    addEnv("HOME");
+    addEnv("DBUS_SESSION_BUS_ADDRESS");
+    addEnv("XAUTHORITY");
+
+    // Log file
+    std::string appWord = command.substr(0, command.find(' '));
+    appWord = appWord.substr(appWord.rfind('/') + 1);
+    std::string logFile = "/tmp/vl2_ns_" + appWord + ".log";
+
+    // ip netns exec runs as root; we drop back to the original user with sudo -u.
+    // sh -c lets us set env vars as a preamble.
+    std::string launchCmd =
+        "nohup sudo ip netns exec " + NS_NAME +
+        " sudo -u " + user + " -- sh -c '" + envStr + command + "'"
+        " >'" + logFile + "' 2>&1 &";
+
+    std::cout << tr(lang, "Launching...\n", "Запуск...\n");
+    int ret = system(launchCmd.c_str());
+
+    usleep(1500000);
+    std::cout << tr(lang, "Log: ", "Лог: ") << logFile << "\n";
+    std::cout << "\n--- " << tr(lang, "last output:", "последний вывод:") << " ---\n";
+    system(("tail -8 '" + logFile + "' 2>/dev/null || echo '(no output yet)'").c_str());
+    std::cout << "---\n";
+
+    if (ret != 0) {
+        std::cout << tr(lang,
+            "\nWarning: launch returned non-zero exit code.\n",
+            "\nПредупреждение: команда запуска вернула ненулевой код.\n");
+    }
+
+    pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+    return true;
+#else
+    (void)command; (void)lang;
+    return false;
+#endif
 }
