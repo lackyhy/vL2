@@ -20,7 +20,9 @@ std::string generateConfig(const Profile& profile, bool tunnelMode, const std::s
 // Generates an xray TUN inbound config (xray v5+).
 // Creates a real virtual network interface that intercepts all system traffic.
 std::string generateTunConfig(const Profile& profile, const Settings& settings);
-bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunnelMode, const std::string& proxyProtocol, std::string& outLogFile, std::string& outListenAddress, ProcessId& outPid);
+// instanceId: 1 = primary proxy (config.json / port proxyPort),
+//             2 = second proxy  (config2.json / port proxy2Port)
+bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunnelMode, const std::string& proxyProtocol, std::string& outLogFile, std::string& outListenAddress, ProcessId& outPid, int instanceId = 1);
 // Launch xray in TUN mode (creates virtual network interface).
 bool launchXrayTun(const Settings& settings, const Profile& profile, std::string& outLogFile, std::string& outIfaceName, ProcessId& outPid);
 bool stopXrayCore(ProcessId pid);

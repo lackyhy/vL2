@@ -343,6 +343,10 @@ static void showSettingsScreen(const Settings& settings) {
     std::cout << " 6. " << tr(lang, "HTTP proxy port (0 = disabled)", "Порт HTTP прокси (0 = откл)") << ": " << settings.httpProxyPort << "\n";
     std::cout << " 7. " << tr(lang, "DNS servers", "DNS серверы") << ": " << settings.dnsServers << "\n";
 
+    // ── Second proxy ──────────────────────────────────────────────────────────
+    std::cout << "\n" << tr(lang, "--- Second Proxy ---", "--- Второй прокси ---") << "\n";
+    std::cout << "13. " << tr(lang, "Second proxy SOCKS5 port", "Порт SOCKS5 второго прокси") << ": " << settings.proxy2Port << "\n";
+
     // ── Tunnel / TUN ──────────────────────────────────────────────────────────
     std::cout << "\n" << tr(lang, "--- TUN Tunnel ---", "--- TUN туннель ---") << "\n";
     std::cout << " 8. " << tr(lang, "Tunnel subnet (TUN interface CIDR)", "Подсеть туннеля (CIDR TUN-интерфейса)") << ": " << settings.tunnelSubnet << "\n";
@@ -586,9 +590,9 @@ void editSettings(Settings& settings) {
             if (k >= '0' && k <= '9') {
                 buf += (char)k;
                 if (buf.size() == 1 && buf[0] == '1') {
-                    // Could be '1' alone or start of '10'-'12'
+                    // Could be '1' alone or start of '10'-'13'
                     int next = readKey();
-                    if (next >= '0' && next <= '2') {
+                    if (next >= '0' && next <= '3') {
                         buf += (char)next;
                     } else if (next == '\n' || next == '\r') {
                         // '1' confirmed
@@ -685,6 +689,19 @@ void editSettings(Settings& settings) {
             std::cout << tr(lang, "Split-tunnel: ", "Split-tunnel: ")
                       << (settings.splitTunnel ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
             pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
+        } else if (option == 13) {
+            std::string portStr = inputString(
+                tr(lang,
+                   "Second proxy SOCKS5 port (current: " + std::to_string(settings.proxy2Port) + ", 1-65535): ",
+                   "Порт SOCKS5 второго прокси (текущий: " + std::to_string(settings.proxy2Port) + ", 1-65535): "),
+                lang);
+            if (!portStr.empty()) {
+                try {
+                    int p = std::stoi(portStr);
+                    if (p >= 1 && p <= 65535) settings.proxy2Port = p;
+                    else { std::cout << tr(lang, "Invalid port.", "Неверный порт.") << "\n"; pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша...")); }
+                } catch (...) { std::cout << tr(lang, "Invalid input.", "Неверный ввод.") << "\n"; pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша...")); }
+            }
         }
     }
 }
@@ -738,6 +755,7 @@ void saveSettings(const Settings& settings) {
     file << "httpProxyPort=" << settings.httpProxyPort   << "\n";
     file << "enableIPv6="    << (settings.enableIPv6     ? "1" : "0") << "\n";
     file << "splitTunnel="   << (settings.splitTunnel    ? "1" : "0") << "\n";
+    file << "proxy2Port="    << settings.proxy2Port       << "\n";
 }
 
 void loadSettings(Settings& settings) {
@@ -772,5 +790,8 @@ void loadSettings(Settings& settings) {
         }
         else if (key == "enableIPv6")    settings.enableIPv6    = (val == "1");
         else if (key == "splitTunnel")   settings.splitTunnel   = (val == "1");
+        else if (key == "proxy2Port") {
+            try { int p = std::stoi(val); if (p >= 1 && p <= 65535) settings.proxy2Port = p; } catch (...) {}
+        }
     }
 }

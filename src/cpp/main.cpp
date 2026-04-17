@@ -13,7 +13,9 @@ int main() {
     std::vector<Profile> profiles = {};
     Settings settings;
     int selected = 0;
+#ifndef _WIN32
     bool trayMode = false;
+#endif
     bool xrayRunning = false;
     bool tunnelModeActive = false;   // legacy transparent-proxy tunnel
     bool tunModeActive    = false;   // real TUN virtual interface mode
@@ -22,6 +24,12 @@ int main() {
     std::string listenAddress;
     std::string activeLogFile;
     std::string activeTunIface;      // e.g. "utun5", "tun0"
+
+    // ── Second proxy instance ─────────────────────────────────────────────────
+    bool xrayRunning2      = false;
+    ProcessId activePid2   = 0;
+    std::string listenAddress2;
+    std::string activeLogFile2;
 
     signal(SIGINT, SIG_IGN);
     loadSettings(settings);
@@ -99,6 +107,10 @@ int main() {
         if (!xrayRunning) {
             activePid = 0;
         }
+        xrayRunning2 = (activePid2 != 0 && isXrayRunning(activePid2));
+        if (!xrayRunning2) {
+            activePid2 = 0;
+        }
 
         clearScreen();
         std::cout << "=== " << mFile::APP_NAME << " " << mFile::APP_VERSION << " ===\n";
@@ -117,6 +129,10 @@ int main() {
             }
             std::cout << "\n";
         }
+        if (xrayRunning2) {
+            std::cout << tr(settings.language, "xray-core #2 PID:", "PID xray-core #2:") << " " << activePid2
+                      << "  [" << tr(settings.language, "proxy", "прокси") << ": " << listenAddress2 << "]\n";
+        }
         std::cout << "\n";
         std::cout << tr(settings.language, "Arrow keys / number + Enter to select.  Q = quit.  Ctrl+F = minimize.",
                                            "Стрелки / цифра + Enter для выбора.  Q = выход.  Ctrl+F = свернуть.") << "\n\n";
@@ -134,6 +150,12 @@ int main() {
                     tr(settings.language, "Disable system VPN", "Отключить системный VPN") :
                     tr(settings.language, "Enable system VPN", "Включить системный VPN");
                 menuItems.push_back(vpnStatus);
+            }
+            if (!xrayRunning2) {
+                menuItems.push_back(tr(settings.language, "Launch second proxy", "Запустить второй прокси"));
+            } else {
+                menuItems.push_back(tr(settings.language, "Show second proxy status", "Показать статус второго прокси"));
+                menuItems.push_back(tr(settings.language, "Stop second proxy", "Остановить второй прокси"));
             }
             menuItems.push_back(tr(settings.language, "Stop xray-core", "Остановить xray-core"));
         }
@@ -154,6 +176,7 @@ int main() {
             clearScreen();
             if (systemVpnActive) cleanupSystemVPN(settings);
             if (tunModeActive)   cleanupTunVPN(settings);
+            if (activePid2 > 0)  stopXrayCore(activePid2);
             if (activePid > 0)   stopXrayCore(activePid);
             std::cout << tr(settings.language, "Exit...", "Выход...") << "\n";
             return 0;
@@ -210,6 +233,9 @@ int main() {
             std::string vpnDisableStr= tr(settings.language, "Disable system VPN", "Отключить системный VPN");
             std::string stopStr      = tr(settings.language, "Stop xray-core", "Остановить xray-core");
             std::string exitStr      = tr(settings.language, "Exit", "Выход");
+            std::string launch2Str   = tr(settings.language, "Launch second proxy", "Запустить второй прокси");
+            std::string status2Str   = tr(settings.language, "Show second proxy status", "Показать статус второго прокси");
+            std::string stop2Str     = tr(settings.language, "Stop second proxy", "Остановить второй прокси");
 
             // ── Helper: pick a profile by key press ───────────────────────────
             auto pickProfile = [&]() -> int {
@@ -330,8 +356,59 @@ int main() {
             } else if (selectedItem == vpnDisableStr) {
                 cleanupSystemVPN(settings);
                 systemVpnActive = false;
+            } else if (selectedItem == launch2Str) {
+                // ── Launch second proxy instance ──────────────────────────────
+                if (profiles.empty()) {
+                    clearScreen();
+                    std::cout << tr(settings.language, "No profiles available. Add profiles first.", "Нет доступных профилей. Сначала добавьте профили.") << "\n";
+                    pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+                } else {
+                    int idx = pickProfile();
+                    if (idx >= 0) {
+                        clearScreen();
+                        std::cout << tr(settings.language, "Proxy protocol for second proxy:", "Протокол второго прокси:") << "\n";
+                        std::cout << "1. SOCKS5\n";
+                        std::cout << "2. HTTP\n";
+                        std::cout << tr(settings.language, "Press 1 or 2 (default SOCKS5): ", "Нажмите 1 или 2 (по умолч. SOCKS5): ");
+                        int pk = readKey();
+                        std::string proxyProtocol2 = (pk == '2') ? "http" : "socks";
+                        if (launchXrayCore(settings, profiles[idx], false, proxyProtocol2,
+                                           activeLogFile2, listenAddress2, activePid2, 2)) {
+                            xrayRunning2 = true;
+                            showXrayLog(activeLogFile2, settings.language);
+                        }
+                    }
+                }
+            } else if (selectedItem == status2Str) {
+                // ── Second proxy status ───────────────────────────────────────
+                clearScreen();
+                std::cout << "=== " << tr(settings.language, "Second proxy status", "Статус второго прокси") << " ===\n\n";
+                std::cout << tr(settings.language, "PID:", "PID:") << " " << activePid2 << "\n";
+                std::cout << tr(settings.language, "Listening on:", "Слушает:") << " " << listenAddress2 << "\n";
+                std::cout << tr(settings.language, "Log file:", "Файл лога:") << " " << activeLogFile2 << "\n";
+                std::cout << tr(settings.language, "Port:", "Порт:") << " " << settings.proxy2Port << "\n";
+                pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+            } else if (selectedItem == stop2Str) {
+                // ── Stop second proxy ─────────────────────────────────────────
+                clearScreen();
+                if (stopXrayCore(activePid2)) {
+                    std::cout << tr(settings.language, "Second proxy stopped.", "Второй прокси остановлен.") << "\n";
+                    activePid2 = 0;
+                    xrayRunning2 = false;
+                    listenAddress2.clear();
+                } else {
+                    std::cout << tr(settings.language, "Failed to stop second proxy.", "Не удалось остановить второй прокси.") << "\n";
+                }
+                pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
             } else if (selectedItem == stopStr) {
                 clearScreen();
+                // Stop second proxy if running
+                if (xrayRunning2 && activePid2 > 0) {
+                    stopXrayCore(activePid2);
+                    activePid2 = 0;
+                    xrayRunning2 = false;
+                    listenAddress2.clear();
+                }
                 if (systemVpnActive) {
                     cleanupSystemVPN(settings);
                     systemVpnActive = false;
@@ -354,9 +431,6 @@ int main() {
             } else if (selectedItem == exitStr) {
                 showCursor();
                 clearScreen();
-                if (systemVpnActive) cleanupSystemVPN(settings);
-                if (tunModeActive)   cleanupTunVPN(settings);
-                if (activePid > 0)   stopXrayCore(activePid);
                 std::cout << tr(settings.language, "Exit...", "Выход...") << "\n";
                 return 0;
             }

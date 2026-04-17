@@ -5,8 +5,8 @@
 
 namespace mFile {
     static constexpr const char* APP_NAME = "vL2";
-    static constexpr const char* APP_VERSION = "1.7.9";
-    static constexpr const char* APP_BUILD = "alpha";
+    static constexpr const char* APP_VERSION = "3.5.8";
+    static constexpr const char* APP_BUILD = "release";
     static constexpr const char* APP_DEVELOPERS = "lcky";
     static constexpr const char* APP_COPYRIGHT = "2026";
     static constexpr const char* APP_DESCRIPTION = "Console interface for xray-core launcher";

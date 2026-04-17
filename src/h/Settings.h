@@ -54,6 +54,10 @@ struct Settings {
     bool enableIPv6 = false;
     // Split-tunnel: when false, only route all traffic through VPN.
     bool splitTunnel = false;
+
+    // ── Second proxy instance ─────────────────────────────────────────────────
+    // Local inbound port for the second xray-core proxy (0 = use default 1081).
+    int proxy2Port = 1081;
 };
 
 #endif // VL2_SETTINGS_H
