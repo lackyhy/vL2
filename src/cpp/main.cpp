@@ -1,7 +1,10 @@
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <filesystem>
 #include <signal.h>
+#include <string>
+#include <algorithm>
 #if defined(__unix__) || defined(__APPLE__)
 #include <unistd.h>
 #elif defined(_WIN32)
@@ -14,7 +17,182 @@
 #include "TrayIcon.h"
 #include "mFile.h"
 
-int main() {
+// Set to true when running in headless CLI mode — suppresses TUI output
+// inside launcher functions (clearScreen, pauseScreen, progress prints).
+bool g_headlessMode = false;
+
+// ── CLI argument parsing ───────────────────────────────────────────────────
+
+enum class CliAction {
+    None,           // no action → show TUI
+    Socks5,         // --socks5
+    Http,           // --http
+    Tun,            // --tun
+    Stop,           // --stop
+    Status,         // --status
+    ListProfiles,   // --list-profiles
+    Download,       // --download
+};
+
+struct CliArgs {
+    CliAction action  = CliAction::None;
+    std::string profile;   // profile name or 1-based index
+    int  port         = 0; // custom listen port (0 = use settings)
+    bool second       = false; // use second proxy slot
+    bool showLog      = true;  // print xray log path on start
+};
+
+static CliArgs parseArgs(int argc, char** argv) {
+    CliArgs a;
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "--socks5" || arg == "-s")           { a.action = CliAction::Socks5; }
+        else if (arg == "--http"    || arg == "-H")      { a.action = CliAction::Http; }
+        else if (arg == "--tun"     || arg == "-t")      { a.action = CliAction::Tun; }
+        else if (arg == "--stop"    || arg == "-x")      { a.action = CliAction::Stop; }
+        else if (arg == "--status"  || arg == "-S")      { a.action = CliAction::Status; }
+        else if (arg == "--list-profiles" || arg == "-l"){ a.action = CliAction::ListProfiles; }
+        else if (arg == "--download"|| arg == "-d")      { a.action = CliAction::Download; }
+        else if (arg == "--second"  || arg == "-2")      { a.second = true; }
+        else if (arg == "--no-log"  || arg == "-n")      { a.showLog = false; }
+        else if ((arg == "--profile" || arg == "-p") && i + 1 < argc) {
+            a.profile = argv[++i];
+        } else if ((arg == "--port" || arg == "-P") && i + 1 < argc) {
+            try { a.port = std::stoi(argv[++i]); } catch (...) {}
+        } else if (arg == "--help" || arg == "-h") {
+            std::cout << "vl2 <3\n\n"
+                      << "Usage: vl2 [OPTIONS]\n\n"
+                      << "  (no args)                      Interactive TUI\n\n"
+                      << "Actions:\n"
+                      << "  --socks5,  -s                  Launch SOCKS5 proxy (headless)\n"
+                      << "  --http,    -H                  Launch HTTP proxy  (headless)\n"
+                      << "  --tun,     -t                  Launch TUN tunnel  (headless)\n"
+                      << "  --stop,    -x                  Stop running xray-core and exit\n"
+                      << "  --status,  -S                  Show xray-core status and exit\n"
+                      << "  --list-profiles, -l            List saved profiles and exit\n"
+                      << "  --download, -d                 Download xray-core binary and exit\n\n"
+                      << "Options:\n"
+                      << "  --profile <name|N>, -p         Profile name or 1-based index\n"
+                      << "  --port <port>,      -P         Custom listen port\n"
+                      << "  --second,           -2         Use second proxy slot\n"
+                      << "  --no-log,           -n         Don't print log file path on start\n\n"
+                      << "Examples:\n"
+                      << "  vl2 -s -p MyVPN\n"
+                      << "  vl2 -H -p 2 -P 8080\n"
+                      << "  vl2 -t -p MyVPN\n"
+                      << "  vl2 -s -2 -p 2 -P 1081\n"
+                      << "  vl2 -x\n"
+                      << "  vl2 -l\n\n"
+                      << "tip: vl2 -s  launches first profile as socks5 right away ;)\n";
+            exit(0);
+        } else {
+            std::cerr << "unknown argument: " << arg << "     404 <3 \n"
+                      << "Try 'vl2 --help' to see available options.\n";
+            exit(1);
+        }
+    }
+    return a;
+}
+
+// Resolve profile by name or 1-based index string. Returns index or -1.
+static int resolveProfile(const std::vector<Profile>& profiles, const std::string& spec) {
+    if (spec.empty()) return profiles.empty() ? -1 : 0;
+    // Try numeric index
+    try {
+        int idx = std::stoi(spec) - 1;
+        if (idx >= 0 && idx < static_cast<int>(profiles.size())) return idx;
+    } catch (...) {}
+    // Try name match (case-insensitive substring)
+    std::string lower = spec;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    for (int i = 0; i < static_cast<int>(profiles.size()); ++i) {
+        std::string n = profiles[i].name;
+        std::transform(n.begin(), n.end(), n.begin(), ::tolower);
+        if (n.find(lower) != std::string::npos) return i;
+    }
+    return -1;
+}
+
+static const char* VL2_PID_FILE = "vl2.pid";
+
+static void writePidFile(ProcessId pid, const std::string& listenAddr) {
+    std::ofstream f(VL2_PID_FILE);
+    if (f) f << pid << "\n" << listenAddr << "\n";
+}
+
+static ProcessId readPidFile(std::string* outListen = nullptr) {
+    std::ifstream f(VL2_PID_FILE);
+    if (!f) return 0;
+    long pid = 0;
+    f >> pid;
+    if (outListen) { std::getline(f, *outListen); std::getline(f, *outListen); }
+    return static_cast<ProcessId>(pid);
+}
+
+static void removePidFile() {
+    std::remove(VL2_PID_FILE);
+}
+
+// ── Headless proxy runner ──────────────────────────────────────────────────
+// Launches proxy, prints status, and exits — xray keeps running in background.
+static int runHeadless(const CliArgs& a, Settings& settings, std::vector<Profile>& profiles) {
+    g_headlessMode = true;
+    // No --profile given → auto-pick first profile ;)
+    int profileIdx = resolveProfile(profiles, a.profile);
+    if (profileIdx < 0) {
+        std::cerr << "404 <3  no profiles found";
+        if (!a.profile.empty()) std::cerr << " matching '" << a.profile << "'";
+        std::cerr << ". Add profiles first (run without args).\n";
+        return 1;
+    }
+
+    std::cout << "[vl2] profile: " << profiles[profileIdx].name
+              << " (" << profiles[profileIdx].type << ") ;)\n";
+
+    // Override port if given
+    if (a.port > 0) {
+        if (a.second) settings.proxy2Port = a.port;
+        else          settings.proxyPort  = a.port;
+    }
+
+    std::string logFile, listenAddr;
+    ProcessId pid = 0;
+    bool ok = false;
+
+    if (a.action == CliAction::Tun) {
+        std::string tunIface;
+        ok = launchXrayTun(settings, profiles[profileIdx], logFile, tunIface, pid);
+        if (ok) {
+            listenAddr = tunIface;
+            std::cout << "[vl2] TUN tunnel started  PID=" << pid
+                      << "  iface=" << tunIface << "  <3\n";
+        }
+    } else {
+        std::string proto = (a.action == CliAction::Http) ? "http" : "socks";
+        int instanceId    = a.second ? 2 : 1;
+        ok = launchXrayCore(settings, profiles[profileIdx], false, proto,
+                            logFile, listenAddr, pid, instanceId);
+        if (ok) {
+            std::cout << "[vl2] " << (proto == "http" ? "HTTP" : "SOCKS5")
+                      << " proxy started  PID=" << pid
+                      << "  listen=" << listenAddr << "  <3\n";
+        }
+    }
+
+    if (!ok) {
+        std::cerr << "[vl2] failed to launch xray-core :(\n";
+        return 1;
+    }
+    writePidFile(pid, listenAddr);
+    if (a.showLog && !logFile.empty()) {
+        std::cout << "[vl2] log: " << logFile << "\n";
+    }
+    std::cout << "[vl2] to stop: vl2 --stop\n";
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    CliArgs cliArgs = parseArgs(argc, argv);
     std::vector<Profile> profiles = {};
     Settings settings;
     int selected = 0;
@@ -42,6 +220,72 @@ int main() {
     loadProfiles(profiles);
     loadAppList(settings);
 
+    // ── Handle CLI-only actions (no TUI) ──────────────────────────────────────
+    if (cliArgs.action == CliAction::ListProfiles) {
+        if (profiles.empty()) {
+            std::cout << "no profiles saved :( run without args to add some.\n";
+            return 0;
+        }
+        std::cout << "profiles <3\n";
+        for (size_t i = 0; i < profiles.size(); ++i) {
+            std::cout << "  " << i + 1 << ". " << profiles[i].name
+                      << "  (" << profiles[i].type << ")  " << profiles[i].address << "\n";
+        }
+        return 0;
+    }
+
+    if (cliArgs.action == CliAction::Download) {
+        std::cout << "[vl2] Downloading xray-core...\n";
+        return downloadXrayCore(settings) ? 0 : 1;
+    }
+
+    if (cliArgs.action == CliAction::Stop) {
+        // Prefer PID file written by headless launch (most reliable)
+        ProcessId pid = readPidFile();
+        if (pid <= 0) {
+            XrayProcessInfo info = findRunningXrayProcess();
+            pid = info.pid;
+        }
+        if (pid <= 0) {
+            std::cout << "[vl2] no running xray-core found :|\n";
+            return 0;
+        }
+        std::cout << "[vl2] stopping xray-core PID=" << pid << "...\n";
+        bool ok = stopXrayCore(pid);
+        if (ok) { removePidFile(); std::cout << "[vl2] stopped. o7\n"; }
+        return ok ? 0 : 1;
+    }
+
+    if (cliArgs.action == CliAction::Status) {
+        std::string listenAddr;
+        ProcessId pid = readPidFile(&listenAddr);
+        if (pid > 0 && isXrayRunning(pid)) {
+            std::cout << "[vl2] running <3\n"
+                      << "  PID:    " << pid << "\n";
+            if (!listenAddr.empty())
+                std::cout << "  listen: " << listenAddr << "\n";
+            return 0;
+        }
+        // Fallback: scan processes
+        XrayProcessInfo info = findRunningXrayProcess();
+        if (info.pid <= 0) {
+            std::cout << "[vl2] not running :|\n";
+            return 0;
+        }
+        std::cout << "[vl2] running <3\n"
+                  << "  PID:    " << info.pid << "\n"
+                  << "  binary: " << info.binaryPath << "\n";
+        if (!info.listenAddress.empty())
+            std::cout << "  listen: " << info.listenAddress << "\n";
+        return 0;
+    }
+
+    if (cliArgs.action == CliAction::Socks5 ||
+        cliArgs.action == CliAction::Http   ||
+        cliArgs.action == CliAction::Tun) {
+        return runHeadless(cliArgs, settings, profiles);
+    }
+
     // Check if xray-core binary exists, offer to download if not
     std::string xrayBinaryPath = findXrayCoreBinary(settings);
     if (!std::filesystem::exists(xrayBinaryPath)) {
@@ -58,25 +302,39 @@ int main() {
         }
     }
 
-    // Check for already running xray-core on startup
-    XrayProcessInfo runningXray = findRunningXrayProcess();
-    if (runningXray.pid > 0) {
-        clearScreen();
-        std::cout << "=== " << tr(settings.language, "Found running xray-core", "Обнаружен запущенный xray-core") << " ===\n\n";
-        std::cout << tr(settings.language, "PID:", "PID:") << " " << runningXray.pid << "\n";
-        std::cout << tr(settings.language, "Binary path:", "Путь бинарника:") << " " << runningXray.binaryPath << "\n";
-        if (!runningXray.listenAddress.empty()) {
-            std::cout << tr(settings.language, "Listening on:", "Слушает на:") << " " << runningXray.listenAddress << "\n";
+    // Check for already running xray-core on startup.
+    // First check vl2.pid (written by headless launch), then scan processes.
+    {
+        std::string pidListen;
+        ProcessId pidFromFile = readPidFile(&pidListen);
+        XrayProcessInfo runningXray;
+        if (pidFromFile > 0 && isXrayRunning(pidFromFile)) {
+            runningXray.pid          = pidFromFile;
+            runningXray.listenAddress = pidListen;
+            runningXray.binaryPath   = "(headless launch)";
+        } else {
+            if (pidFromFile > 0) removePidFile(); // stale pid file
+            runningXray = findRunningXrayProcess();
         }
-        std::cout << "\n" << tr(settings.language, "Use this process or start a new one?", "Использовать этот процесс или запустить новый?") << "\n";
-        std::cout << "1. " << tr(settings.language, "Use running process", "Использовать запущенный процесс") << "\n";
-        std::cout << "2. " << tr(settings.language, "Start new process", "Запустить новый процесс") << "\n";
-        std::cout << tr(settings.language, "Press 1 or 2:", "Нажмите 1 или 2:") << " ";
-        int choice = readKey();
-        if (choice == '1') {
-            activePid = runningXray.pid;
-            xrayRunning = true;
-            listenAddress = runningXray.listenAddress;
+
+        if (runningXray.pid > 0) {
+            clearScreen();
+            std::cout << "=== " << tr(settings.language, "Found running xray-core", "Обнаружен запущенный xray-core") << " ===\n\n";
+            std::cout << tr(settings.language, "PID:", "PID:") << " " << runningXray.pid << "\n";
+            std::cout << tr(settings.language, "Binary path:", "Путь бинарника:") << " " << runningXray.binaryPath << "\n";
+            if (!runningXray.listenAddress.empty()) {
+                std::cout << tr(settings.language, "Listening on:", "Слушает на:") << " " << runningXray.listenAddress << "\n";
+            }
+            std::cout << "\n" << tr(settings.language, "Use this process or start a new one?", "Использовать этот процесс или запустить новый?") << "\n";
+            std::cout << "1. " << tr(settings.language, "Use running process", "Использовать запущенный процесс") << "\n";
+            std::cout << "2. " << tr(settings.language, "Start new process", "Запустить новый процесс") << "\n";
+            std::cout << tr(settings.language, "Press 1 or 2:", "Нажмите 1 или 2:") << " ";
+            int choice = readKey();
+            if (choice == '1') {
+                activePid     = runningXray.pid;
+                xrayRunning   = true;
+                listenAddress = runningXray.listenAddress;
+            }
         }
     }
 
@@ -168,7 +426,7 @@ int main() {
             menuItems.push_back(tr(settings.language, "Stop xray-core", "Остановить xray-core"));
         }
         menuItems.push_back(tr(settings.language, "Exit", "Выход"));
-        selected = std::min(selected, static_cast<int>(menuItems.size()) - 1);
+        selected = (std::min)(selected, static_cast<int>(menuItems.size()) - 1);
 
         for (size_t i = 0; i < menuItems.size(); ++i) {
             std::cout << (static_cast<int>(i) == selected ? "> " : "  ");

@@ -23,6 +23,8 @@
 
 namespace fs = std::filesystem;
 
+extern bool g_headlessMode;
+
 std::string generateConfig(const Profile& profile) {
     return generateConfig(profile, false);
 }
@@ -727,22 +729,26 @@ std::string findXrayCoreBinary(const Settings& settings) {
 }
 
 bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunnelMode, const std::string& proxyProtocol, std::string& outLogFile, std::string& outListenAddress, ProcessId& outPid, int instanceId) {
-    clearScreen();
-    std::string instanceLabel = (instanceId == 2)
-        ? tr(settings.language, "Launch xray-core #2", "Запуск xray-core #2")
-        : tr(settings.language, "Launch xray-core", "Запуск xray-core");
-    std::cout << "=== " << instanceLabel << " ===\n\n";
+    if (!g_headlessMode) {
+        clearScreen();
+        std::string instanceLabel = (instanceId == 2)
+            ? tr(settings.language, "Launch xray-core #2", "Запуск xray-core #2")
+            : tr(settings.language, "Launch xray-core", "Запуск xray-core");
+        std::cout << "=== " << instanceLabel << " ===\n\n";
+    }
 
     std::string binaryPath = findXrayCoreBinary(settings);
     if (binaryPath.empty()) {
-        std::cout << tr(settings.language,
+        std::cerr << tr(settings.language,
             "xray-core binary not found. Put xray binary into the xray/ folder and try again.",
             "Бинарник xray-core не найден. Поместите бинарник xray в папку xray/ и попробуйте снова.") << "\n";
-        pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+        if (!g_headlessMode)
+            pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
         return false;
     }
 
-    std::cout << tr(settings.language, "Found: ", "Найден: ") << binaryPath << "\n";
+    if (!g_headlessMode)
+        std::cout << tr(settings.language, "Found: ", "Найден: ") << binaryPath << "\n";
 
     // Quick availability check (silent)
     std::vector<std::string> versionArgs = {"-version", "--version", "version"};
@@ -759,7 +765,7 @@ bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunne
             break;
         }
     }
-    if (!available) {
+    if (!available && !g_headlessMode) {
         std::cout << tr(settings.language,
             "Warning: binary version check failed. Make sure it is executable.",
             "Предупреждение: проверка версии бинарника не прошла. Убедитесь, что он исполняемый.") << "\n";
@@ -784,17 +790,19 @@ bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunne
 
     std::ofstream configFile(configFileName);
     if (!configFile) {
-        std::cout << tr(settings.language,
+        std::cerr << tr(settings.language,
             "Failed to create config file: ", "Не удалось создать файл конфигурации: ")
             << configFileName << "\n";
-        pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+        if (!g_headlessMode)
+            pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
         return false;
     }
     configFile << config;
     configFile.close();
 
     outLogFile = logFileName;
-    std::cout << tr(settings.language, "Starting xray-core...", "Запуск xray-core...") << "\n";
+    if (!g_headlessMode)
+        std::cout << tr(settings.language, "Starting xray-core...", "Запуск xray-core...") << "\n";
 
 #ifdef _WIN32
     // Use PowerShell Start-Process to reliably capture the PID.
@@ -853,26 +861,29 @@ bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunne
 #endif
 
     if (launchResult != 0 || outPid <= 0) {
-        std::cout << tr(settings.language,
+        std::cerr << tr(settings.language,
             "Failed to start xray-core. See log for details: ",
             "Не удалось запустить xray-core. Смотрите лог: ") << outLogFile << "\n";
-        pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+        if (!g_headlessMode)
+            pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
         return false;
     }
 
     std::string listenAddress = "127.0.0.1:" + std::to_string(port);
-    std::cout << tr(settings.language, "xray-core started. Log: ", "xray-core запущен. Лог: ") << outLogFile << "\n";
-    std::cout << tr(settings.language, "Listening on: ", "Слушает: ") << listenAddress << "\n";
-    if (tunnelMode) {
-        std::cout << tr(settings.language,
-            "Tunnel mode active. Use 'Enable system VPN' to redirect all traffic.",
-            "Режим туннеля активен. Используйте 'Включить системный VPN' для перенаправления трафика.") << "\n";
-    } else {
-        std::cout << tr(settings.language, "Proxy mode: ", "Режим прокси: ") << actualProxyProtocol
-                  << " -> " << listenAddress << "\n";
+    if (!g_headlessMode) {
+        std::cout << tr(settings.language, "xray-core started. Log: ", "xray-core запущен. Лог: ") << outLogFile << "\n";
+        std::cout << tr(settings.language, "Listening on: ", "Слушает: ") << listenAddress << "\n";
+        if (tunnelMode) {
+            std::cout << tr(settings.language,
+                "Tunnel mode active. Use 'Enable system VPN' to redirect all traffic.",
+                "Режим туннеля активен. Используйте 'Включить системный VPN' для перенаправления трафика.") << "\n";
+        } else {
+            std::cout << tr(settings.language, "Proxy mode: ", "Режим прокси: ") << actualProxyProtocol
+                      << " -> " << listenAddress << "\n";
+        }
+        pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
     }
     outListenAddress = listenAddress;
-    pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
     return true;
 }
 
@@ -896,6 +907,7 @@ static std::string resolveHostname(const std::string& host) {
     }
     if (isIp && host.find('.') != std::string::npos) return host;
 
+#if defined(__unix__) || defined(__APPLE__)
     // Try dig first, then host, then nslookup
     std::string cmd = "dig +short " + host + " A 2>/dev/null | grep -E '^[0-9]+\\.' | head -1";
     FILE* p = popen(cmd.c_str(), "r");
@@ -917,6 +929,7 @@ static std::string resolveHostname(const std::string& host) {
         buf[strcspn(buf, "\n ")] = '\0';
         if (buf[0]) return buf;
     }
+#endif
 
     return {};  // resolution failed
 }
@@ -1802,7 +1815,31 @@ bool isXrayRunning(ProcessId pid) {
 XrayProcessInfo findRunningXrayProcess() {
     XrayProcessInfo info;
     info.pid = 0;
-#if defined(__unix__) || defined(__APPLE__)
+#ifdef _WIN32
+    // Try to find xray.exe or xray-core.exe via tasklist
+    const char* queries[] = {
+        "tasklist /FI \"IMAGENAME eq xray.exe\" /FO CSV /NH 2>nul",
+        "tasklist /FI \"IMAGENAME eq xray-core.exe\" /FO CSV /NH 2>nul"
+    };
+    for (const char* q : queries) {
+        FILE* pipe = _popen(q, "r");
+        if (!pipe) continue;
+        char buf[512] = {0};
+        while (fgets(buf, sizeof(buf), pipe)) {
+            // CSV format: "xray.exe","1234","Console","1","..."
+            if (buf[0] != '"') continue;
+            char imgName[128] = {0};
+            long pid = 0;
+            if (sscanf(buf, "\"%127[^\"]\",%ld", imgName, &pid) == 2 && pid > 0) {
+                info.pid = static_cast<ProcessId>(pid);
+                info.binaryPath = imgName;
+                break;
+            }
+        }
+        _pclose(pipe);
+        if (info.pid > 0) break;
+    }
+#elif defined(__unix__) || defined(__APPLE__)
     // Look for xray process (exclude grep itself with [x]ray pattern)
     FILE* pipe = popen("ps aux 2>/dev/null | grep '[x]ray' | head -1", "r");
     if (!pipe) return info;
@@ -2172,6 +2209,7 @@ static bool isElectronApp(const std::string& cmd) {
 // Resolve a bare command word ("discord") to its full path ("/usr/bin/discord").
 static std::string resolveBin(const std::string& word) {
     if (word.empty() || word[0] == '/' || word[0] == '.') return word;
+#if defined(__unix__) || defined(__APPLE__)
     FILE* p = popen(("command -v " + word + " 2>/dev/null").c_str(), "r");
     if (!p) return word;
     char buf[512] = {0};
@@ -2179,6 +2217,9 @@ static std::string resolveBin(const std::string& word) {
     pclose(p);
     buf[strcspn(buf, "\n ")] = '\0';
     return buf[0] ? std::string(buf) : word;
+#else
+    return word;
+#endif
 }
 
 void launchAppThroughProxy(const std::string& command, int proxyPort,
