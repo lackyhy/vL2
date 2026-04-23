@@ -315,51 +315,86 @@ static void addProfileFromLink(std::vector<Profile>& profiles, Language lang) {
     pauseScreen(tr(lang, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
 }
 
-static void showSettingsScreen(const Settings& settings) {
+// Build the ordered list of visible option numbers based on current settings.
+// Section-header entries use negative numbers (not selectable by cursor).
+static std::vector<int> buildVisibleOptions(const Settings& settings) {
+    std::vector<int> v = {1, 2, 3, 4, 5, 6, 7, 14};
+    if (settings.socks5Auth) {
+        v.push_back(15);
+        v.push_back(16);
+    }
+    v.insert(v.end(), {13, 8, 9, 10, 11, 12});
+    return v;
+}
+
+static void showSettingsScreen(const Settings& settings, int highlightedOpt = -1) {
     clearScreen();
     Language lang = settings.language;
-    std::cout << "=== " << tr(lang, "Settings", "Настройки") << " ===\n\n";
+    std::cout << "=== " << tr(lang, "Settings", "Настройки") << " ===\n";
+    std::cout << tr(lang, "Arrow keys or number to select, Enter to change, 0 to return.",
+                          "Стрелки или цифра для выбора, Enter для изменения, 0 для возврата.") << "\n\n";
+
+    // Helper: print one row with cursor indicator.
+    auto row = [&](int opt, const std::string& lbl, const std::string& val) {
+        bool sel = (opt == highlightedOpt);
+        if (opt < 10)
+            std::cout << (sel ? "> " : "  ") << " " << opt << ". " << lbl << ": " << val << "\n";
+        else
+            std::cout << (sel ? "> " : "  ") << opt << ". " << lbl << ": " << val << "\n";
+    };
+
+    std::string logVal;
+    switch (settings.logLevel) {
+        case 1: logVal = "1 (debug)";   break;
+        case 2: logVal = "2 (info)";    break;
+        case 3: logVal = "3 (warning)"; break;
+        case 4: logVal = "4 (error)";   break;
+        case 5: logVal = "5 (none)";    break;
+        default: logVal = std::to_string(settings.logLevel); break;
+    }
 
     // ── General ──────────────────────────────────────────────────────────────
     std::cout << tr(lang, "--- General ---", "--- Основные ---") << "\n";
-    std::cout << " 1. " << tr(lang, "Auto-start xray-core", "Автостарт xray-core") << ": "
-              << (settings.autoStart ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
-    std::cout << " 2. " << tr(lang, "Language", "Язык") << ": " << languageName(settings.language) << "\n";
-    std::cout << " 3. " << tr(lang, "Log level (1-debug … 5-off)", "Уровень лога (1-debug … 5-off)") << ": ";
-    switch (settings.logLevel) {
-        case 1: std::cout << "1 (debug)";   break;
-        case 2: std::cout << "2 (info)";    break;
-        case 3: std::cout << "3 (warning)"; break;
-        case 4: std::cout << "4 (error)";   break;
-        case 5: std::cout << "5 (none)";    break;
-        default: std::cout << settings.logLevel; break;
-    }
-    std::cout << "\n";
-    std::cout << " 4. " << tr(lang, "xray-core folder", "Папка xray-core") << ": " << settings.xrayCoreDir << "\n";
+    row(1,  tr(lang, "Auto-start xray-core",          "Автостарт xray-core"),
+        settings.autoStart ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ"));
+    row(2,  tr(lang, "Language",                      "Язык"), languageName(settings.language));
+    row(3,  tr(lang, "Log level (1-debug ... 5-off)", "Уровень лога (1-debug ... 5-off)"), logVal);
+    row(4,  tr(lang, "xray-core folder",              "Папка xray-core"), settings.xrayCoreDir);
 
     // ── Proxy ─────────────────────────────────────────────────────────────────
     std::cout << "\n" << tr(lang, "--- Proxy ---", "--- Прокси ---") << "\n";
-    std::cout << " 5. " << tr(lang, "SOCKS5 proxy port", "Порт SOCKS5 прокси") << ": " << settings.proxyPort << "\n";
-    std::cout << " 6. " << tr(lang, "HTTP proxy port (0 = disabled)", "Порт HTTP прокси (0 = откл)") << ": " << settings.httpProxyPort << "\n";
-    std::cout << " 7. " << tr(lang, "DNS servers", "DNS серверы") << ": " << settings.dnsServers << "\n";
+    row(5,  tr(lang, "SOCKS5 proxy port",                   "Порт SOCKS5 прокси"),
+        std::to_string(settings.proxyPort));
+    row(6,  tr(lang, "HTTP proxy port (0 = disabled)",      "Порт HTTP прокси (0 = откл)"),
+        std::to_string(settings.httpProxyPort));
+    row(7,  tr(lang, "DNS servers",                         "DNS серверы"), settings.dnsServers);
+    row(14, tr(lang, "SOCKS5 local auth",                   "Локальная аутентификация SOCKS5"),
+        settings.socks5Auth ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ"));
+    if (settings.socks5Auth) {
+        row(15, tr(lang, "SOCKS5 username", "Логин SOCKS5"),
+            settings.socks5Username.empty() ? tr(lang, "(not set)", "(не задан)") : settings.socks5Username);
+        row(16, tr(lang, "SOCKS5 password", "Пароль SOCKS5"),
+            settings.socks5Password.empty() ? tr(lang, "(not set)", "(не задан)") : std::string(settings.socks5Password.size(), '*'));
+    }
 
     // ── Second proxy ──────────────────────────────────────────────────────────
     std::cout << "\n" << tr(lang, "--- Second Proxy ---", "--- Второй прокси ---") << "\n";
-    std::cout << "13. " << tr(lang, "Second proxy SOCKS5 port", "Порт SOCKS5 второго прокси") << ": " << settings.proxy2Port << "\n";
+    row(13, tr(lang, "Second proxy SOCKS5 port", "Порт SOCKS5 второго прокси"),
+        std::to_string(settings.proxy2Port));
 
     // ── Tunnel / TUN ──────────────────────────────────────────────────────────
     std::cout << "\n" << tr(lang, "--- TUN Tunnel ---", "--- TUN туннель ---") << "\n";
-    std::cout << " 8. " << tr(lang, "Tunnel subnet (TUN interface CIDR)", "Подсеть туннеля (CIDR TUN-интерфейса)") << ": " << settings.tunnelSubnet << "\n";
-    std::cout << " 9. " << tr(lang, "TUN interface name (auto = OS chooses)", "Имя TUN интерфейса (auto = выбирает ОС)") << ": " << settings.tunInterface << "\n";
-    std::cout << "10. " << tr(lang, "Kill-switch (block traffic if VPN drops)", "Kill-switch (блок трафика при обрыве VPN)") << ": "
-              << (settings.killSwitch ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
-    std::cout << "11. " << tr(lang, "Route IPv6 through tunnel", "Маршрутизация IPv6 через туннель") << ": "
-              << (settings.enableIPv6 ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
-    std::cout << "12. " << tr(lang, "Split-tunnel (bypass local/CN traffic)", "Split-tunnel (обход локального/CN трафика)") << ": "
-              << (settings.splitTunnel ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
-
-    std::cout << "\n" << tr(lang, "Type a number to change the option, or press 0 to return.",
-                                 "Введите цифру для изменения опции или 0 для возвращения.") << "\n";
+    row(8,  tr(lang, "Tunnel subnet (TUN interface CIDR)",       "Подсеть туннеля (CIDR TUN-интерфейса)"),
+        settings.tunnelSubnet);
+    row(9,  tr(lang, "TUN interface name (auto = OS chooses)",   "Имя TUN интерфейса (auto = выбирает ОС)"),
+        settings.tunInterface);
+    row(10, tr(lang, "Kill-switch (block traffic if VPN drops)", "Kill-switch (блок трафика при обрыве VPN)"),
+        settings.killSwitch  ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ"));
+    row(11, tr(lang, "Route IPv6 through tunnel",                "Маршрутизация IPv6 через туннель"),
+        settings.enableIPv6  ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ"));
+    row(12, tr(lang, "Split-tunnel (bypass local/CN traffic)",   "Split-tunnel (обход локального/CN трафика)"),
+        settings.splitTunnel ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ"));
+    std::cout << "\n";
 }
 
 static void printProfileEditMenu(const Profile& profile, Language lang) {
@@ -580,40 +615,66 @@ void editProfiles(std::vector<Profile>& profiles, Language lang) {
 }
 
 void editSettings(Settings& settings) {
-    auto readOption = [&]() -> int {
-        // Reads a 1- or 2-digit option number, similar to editProfile.
-        std::string buf;
-        while (true) {
-            int k = readKey();
-            if (k == 3) return -1;   // Ctrl+C → ignore
-            if (k == '0' && buf.empty()) return 0;
-            if (k >= '0' && k <= '9') {
-                buf += (char)k;
-                if (buf.size() == 1 && buf[0] == '1') {
-                    // Could be '1' alone or start of '10'-'13'
-                    int next = readKey();
-                    if (next >= '0' && next <= '3') {
-                        buf += (char)next;
-                    } else if (next == '\n' || next == '\r') {
-                        // '1' confirmed
-                    }
-                    // else: ignore extra key, use '1'
-                }
-                try { return std::stoi(buf); } catch (...) { return -1; }
-            }
-            if (k == '\n' || k == '\r') return -1;
-        }
-    };
-
     Language& lang = settings.language;
+    int cursorIdx = 0;  // index into buildVisibleOptions(settings)
 
     while (true) {
-        showSettingsScreen(settings);
-        int option = readOption();
-        if (option == -1) continue;
-        if (option == 0) break;
+        auto opts = buildVisibleOptions(settings);
+        if (cursorIdx >= static_cast<int>(opts.size())) cursorIdx = 0;
 
+        showSettingsScreen(settings, opts[cursorIdx]);
+
+        int k = readKey();
+        if (k == 3) continue;   // Ctrl+C
+        if (k == '0') break;
+
+        // ── Arrow navigation ─────────────────────────────────────────────────
+        if (k == 1001) {  // up
+            cursorIdx = (cursorIdx - 1 + static_cast<int>(opts.size())) % static_cast<int>(opts.size());
+            continue;
+        }
+        if (k == 1002) {  // down
+            cursorIdx = (cursorIdx + 1) % static_cast<int>(opts.size());
+            continue;
+        }
+
+        // ── Resolve option number ─────────────────────────────────────────────
+        int option = -1;
+
+        if (k == '\n' || k == '\r') {
+            // Enter: activate item under cursor
+            option = opts[cursorIdx];
+        } else if (k >= '1' && k <= '9') {
+            // Number key: build 1- or 2-digit option, then move cursor to it
+            std::string buf(1, static_cast<char>(k));
+            if (k == '1') {
+                // Could be '1' alone or start of 10-16
+                int next = readKey();
+                if (next >= '0' && next <= '9') {
+                    buf += static_cast<char>(next);
+                } else if (next == '\n' || next == '\r') {
+                    // '1' alone confirmed
+                } else if (next == 1001) {
+                    cursorIdx = (cursorIdx - 1 + static_cast<int>(opts.size())) % static_cast<int>(opts.size());
+                    continue;
+                } else if (next == 1002) {
+                    cursorIdx = (cursorIdx + 1) % static_cast<int>(opts.size());
+                    continue;
+                }
+                // else: ignore extra key, treat as '1'
+            }
+            try { option = std::stoi(buf); } catch (...) { continue; }
+            // Move cursor to this option if visible
+            for (int i = 0; i < static_cast<int>(opts.size()); ++i) {
+                if (opts[i] == option) { cursorIdx = i; break; }
+            }
+        }
+
+        if (option <= 0) continue;
+
+        // ── Process option ────────────────────────────────────────────────────
         clearScreen();
+
         if (option == 1) {
             settings.autoStart = !settings.autoStart;
         } else if (option == 2) {
@@ -676,19 +737,10 @@ void editSettings(Settings& settings) {
             if (!iface.empty()) settings.tunInterface = iface;
         } else if (option == 10) {
             settings.killSwitch = !settings.killSwitch;
-            std::cout << tr(lang, "Kill-switch: ", "Kill-switch: ")
-                      << (settings.killSwitch ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
-            pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
         } else if (option == 11) {
             settings.enableIPv6 = !settings.enableIPv6;
-            std::cout << tr(lang, "IPv6 tunnel: ", "IPv6 туннель: ")
-                      << (settings.enableIPv6 ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
-            pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
         } else if (option == 12) {
             settings.splitTunnel = !settings.splitTunnel;
-            std::cout << tr(lang, "Split-tunnel: ", "Split-tunnel: ")
-                      << (settings.splitTunnel ? tr(lang, "ON", "ВКЛ") : tr(lang, "OFF", "ВЫКЛ")) << "\n";
-            pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша..."));
         } else if (option == 13) {
             std::string portStr = inputString(
                 tr(lang,
@@ -702,6 +754,23 @@ void editSettings(Settings& settings) {
                     else { std::cout << tr(lang, "Invalid port.", "Неверный порт.") << "\n"; pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша...")); }
                 } catch (...) { std::cout << tr(lang, "Invalid input.", "Неверный ввод.") << "\n"; pauseScreen(tr(lang, "\nPress any key...", "\nЛюбая клавиша...")); }
             }
+        } else if (option == 14) {
+            settings.socks5Auth = !settings.socks5Auth;
+            // Rebuild visible opts; keep cursor inside bounds
+            auto newOpts = buildVisibleOptions(settings);
+            if (cursorIdx >= static_cast<int>(newOpts.size())) cursorIdx = static_cast<int>(newOpts.size()) - 1;
+        } else if (option == 15) {
+            std::string u = inputString(
+                tr(lang,
+                   "SOCKS5 username (current: " + (settings.socks5Username.empty() ? "(none)" : settings.socks5Username) + "): ",
+                   "Логин SOCKS5 (текущий: " + (settings.socks5Username.empty() ? "(нет)" : settings.socks5Username) + "): "),
+                lang);
+            settings.socks5Username = u;
+        } else if (option == 16) {
+            std::string p = inputString(
+                tr(lang, "SOCKS5 password: ", "Пароль SOCKS5: "),
+                lang);
+            settings.socks5Password = p;
         }
     }
 }
@@ -791,6 +860,9 @@ void saveSettings(const Settings& settings) {
     file << "enableIPv6="    << (settings.enableIPv6     ? "1" : "0") << "\n";
     file << "splitTunnel="   << (settings.splitTunnel    ? "1" : "0") << "\n";
     file << "proxy2Port="    << settings.proxy2Port       << "\n";
+    file << "socks5Auth="   << (settings.socks5Auth      ? "1" : "0") << "\n";
+    file << "socks5User="   << settings.socks5Username   << "\n";
+    file << "socks5Pass="   << settings.socks5Password   << "\n";
 }
 
 void loadSettings(Settings& settings) {
@@ -828,6 +900,9 @@ void loadSettings(Settings& settings) {
         else if (key == "proxy2Port") {
             try { int p = std::stoi(val); if (p >= 1 && p <= 65535) settings.proxy2Port = p; } catch (...) {}
         }
+        else if (key == "socks5Auth")  settings.socks5Auth     = (val == "1");
+        else if (key == "socks5User")  settings.socks5Username = val;
+        else if (key == "socks5Pass")  settings.socks5Password = val;
     }
 }
 

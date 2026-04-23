@@ -17,6 +17,9 @@ std::string generateConfig(const Profile& profile);
 std::string generateConfig(const Profile& profile, bool tunnelMode);
 std::string generateConfig(const Profile& profile, bool tunnelMode, const std::string& proxyProtocol);
 std::string generateConfig(const Profile& profile, bool tunnelMode, const std::string& proxyProtocol, int port);
+// Full version with optional local SOCKS5 authentication.
+std::string generateConfig(const Profile& profile, bool tunnelMode, const std::string& proxyProtocol, int port,
+                           bool socks5Auth, const std::string& socks5Username, const std::string& socks5Password);
 // Generates an xray TUN inbound config (xray v5+).
 // Creates a real virtual network interface that intercepts all system traffic.
 std::string generateTunConfig(const Profile& profile, const Settings& settings);

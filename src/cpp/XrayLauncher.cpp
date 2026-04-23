@@ -36,6 +36,11 @@ std::string generateConfig(const Profile& profile, bool tunnelMode, const std::s
 }
 
 std::string generateConfig(const Profile& profile, bool tunnelMode, const std::string& proxyProtocol, int port) {
+    return generateConfig(profile, tunnelMode, proxyProtocol, port, false, "", "");
+}
+
+std::string generateConfig(const Profile& profile, bool tunnelMode, const std::string& proxyProtocol, int port,
+                           bool socks5Auth, const std::string& socks5Username, const std::string& socks5Password) {
     std::ostringstream oss;
     std::string inboundProto = tunnelMode ? "dokodemo-door" : proxyProtocol;
     std::string listenAddr = "127.0.0.1";  // Always listen on localhost for transparent redirect
@@ -64,9 +69,18 @@ std::string generateConfig(const Profile& profile, bool tunnelMode, const std::s
 )";
     } else {
         // SOCKS
-        oss << R"(
+        if (socks5Auth && !socks5Username.empty()) {
+            oss << R"(
+        "auth": "password",
+        "accounts": [
+          { "user": ")" << socks5Username << R"(", "pass": ")" << socks5Password << R"(" }
+        ]
+)";
+        } else {
+            oss << R"(
         "auth": "noauth"
 )";
+        }
     }
     oss << R"(
       },
@@ -765,7 +779,8 @@ bool launchXrayCore(const Settings& settings, const Profile& profile, bool tunne
     std::string logFileName    = (instanceId == 2) ? "xray-core2.log" : "xray-core.log";
 
     std::string actualProxyProtocol = tunnelMode ? "dokodemo-door" : proxyProtocol;
-    std::string config = generateConfig(profile, tunnelMode, actualProxyProtocol, port);
+    std::string config = generateConfig(profile, tunnelMode, actualProxyProtocol, port,
+                                        settings.socks5Auth, settings.socks5Username, settings.socks5Password);
 
     std::ofstream configFile(configFileName);
     if (!configFile) {
@@ -2317,7 +2332,13 @@ std::string generateNetNSSocksConfig(const Profile& profile, const Settings& set
         << "    \"port\": " << port << ",\n"
         << "    \"listen\": \"0.0.0.0\",\n"   // ← all interfaces
         << "    \"protocol\": \"socks\",\n"
-        << "    \"settings\": { \"auth\": \"noauth\" },\n"
+        << "    \"settings\": { \"auth\": \""
+        << (settings.socks5Auth && !settings.socks5Username.empty() ? "password" : "noauth") << "\""
+        << (settings.socks5Auth && !settings.socks5Username.empty()
+            ? (std::string(", \"accounts\": [{ \"user\": \"") + settings.socks5Username
+              + "\", \"pass\": \"" + settings.socks5Password + "\" }]")
+            : "")
+        << " },\n"
         << "    \"sniffing\": { \"enabled\": true, \"destOverride\": [\"http\",\"tls\"] }\n"
         << "  }],\n"
         << "  \"outbounds\": [{\n"

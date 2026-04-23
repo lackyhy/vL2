@@ -68,6 +68,13 @@ struct Settings {
     // Local inbound port for the second xray-core proxy (0 = use default 1081).
     int proxy2Port = 1081;
 
+    // ── SOCKS5 local authentication ───────────────────────────────────────────
+    // When enabled, clients connecting to the local SOCKS5 inbound must
+    // supply socks5Username / socks5Password.
+    bool socks5Auth = false;
+    std::string socks5Username = "";
+    std::string socks5Password = "";
+
     // ── Per-app proxy list ────────────────────────────────────────────────────
     // Apps/commands the user wants to route through the SOCKS5 proxy.
     // vL2 launches them with proxy env-vars (or proxychains if installed).

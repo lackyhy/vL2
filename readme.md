@@ -1,70 +1,149 @@
 # vL2
 
-Консольный клиент для xray-core с поддержкой множества подключений и фильтрацией трафика по сайтам и приложениям.
+Console client for xray-core with support for multiple connections and traffic filtering by sites and applications.
 
-## Возможности
+## Features
 
-- 📡 Управление несколькими профилями подключений (VMess, VLESS, Trojan, Shadowsocks)
-- 🔍 Фильтрация трафика по доменам (allow/block/proxy)
-- 🎯 Фильтрация по процессам/приложениям (например, Telegram, Discord)
-- 🖥️ TUI (Terminal User Interface) для удобного управления
-- ⚡ Быстрое переключение между профилями
-- 📊 Логи в реальном времени
-- 🔧 Работа через xray-core
+- Multiple connection profiles (VMess, VLESS, Trojan, Shadowsocks)
+- Domain-based traffic filtering (allow / block / proxy)
+- Per-process / per-application routing (Telegram, Discord, etc.)
+- TUI (Terminal User Interface) with arrow-key navigation
+- Fast profile switching
+- Real-time logs
+- Optional SOCKS5 local authentication
+- Powered by xray-core
 
-## Установка
+## Requirements
 
-### Предварительные требования
+- xray-core binary (placed in `./xray/` or configured via Settings)
+- CMake 3.10+
+- C++17 compiler (g++ / clang++)
 
-- Go 1.21+
-- xray-core (устанавливается автоматически)
+## Build
 
-### Из исходников
+<details>
+<summary>macOS</summary>
 
-```bash
-[git clone https://github.com/lackyhy/vL2.git
-cd vl2
-make build
-```
-
-### Сборка C++ основы
-
-Linux/macOS:
+**Prerequisites:** Xcode Command Line Tools and optionally Homebrew.
 
 ```bash
-g++ main.cpp -o vl2 -std=c++17
-./vl2
+# Install cmake if missing
+brew install cmake
+
+# Build
+./build.sh
 ```
 
-Windows (MSVC):
-
-```powershell
-cl /EHsc main.cpp /Fe:vl2.exe
-vl2.exe
-```
-
-Windows (MinGW):
-
-```bash
-g++ main.cpp -o vl2.exe -std=c++17
-vl2.exe
-```
-
-### CMake сборка
+Or manually:
 
 ```bash
 mkdir -p build
-cd build
-cmake ..
-cmake --build .
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -- -j$(sysctl -n hw.ncpu)
 ```
 
-### Использование xray-core из папки
+The binary is placed at `build/vl2`.
 
-<!-- Положите исполняемый файл `xray-core` (или `xray-core.exe` на Windows) в папку `./xray-core`. -->
+</details>
 
-В приложении в меню `Настройки` можно указать путь к папке `xray-core`, а также выбрать язык.
-По умолчанию интерфейс запускается на английском.
+<details>
+<summary>Linux (Debian / Ubuntu)</summary>
 
-<!--
-> В этой версии реализовано меню с выбором стрелками и цифрами, разделы `Профили` и `Настройки`, а также выбор языка и папки xray-core. -->
+```bash
+sudo apt-get update
+sudo apt-get install -y cmake g++ make
+
+./build.sh
+```
+
+Or manually:
+
+```bash
+mkdir -p build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -- -j$(nproc)
+```
+
+</details>
+
+<details>
+<summary>Arch Linux</summary>
+
+```bash
+sudo pacman -Sy --needed cmake gcc make
+
+./build.sh
+```
+
+Or manually:
+
+```bash
+mkdir -p build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -- -j$(nproc)
+```
+
+</details>
+
+<details>
+<summary>Linux (Fedora / RHEL)</summary>
+
+```bash
+sudo dnf install -y cmake gcc-c++ make
+
+./build.sh
+```
+
+</details>
+
+<details>
+<summary>Windows (MSVC)</summary>
+
+```powershell
+mkdir build
+cd build
+cmake ..
+cmake --build . --config Release
+```
+
+</details>
+
+<details>
+<summary>Windows (MinGW / MSYS2)</summary>
+
+```bash
+mkdir -p build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G "MinGW Makefiles"
+cmake --build build -- -j4
+```
+
+MinGW builds statically link the C++ runtime — no extra DLLs needed.
+
+</details>
+
+## Embedding xray-core (optional)
+
+Place the xray binary in `./xray/xray` (macOS/Linux) or `./xray/xray.exe` (Windows) before running CMake.  
+If found, the binary is embedded directly into the vl2 executable via `.incbin` (GCC / Clang only).  
+Without embedding, vl2 searches for xray at runtime using the path configured in Settings.
+
+## Usage
+
+```bash
+./build/vl2
+```
+
+Navigate with arrow keys or number keys. Press `Q` to quit, `Ctrl+F` to minimize, `Ctrl+T` to view xray-core logs.
+
+In the **Settings** menu (option 4 from the main menu) you can configure:
+
+- SOCKS5 / HTTP proxy ports
+- SOCKS5 local authentication (username + password)
+- DNS servers
+- TUN interface, kill-switch, split-tunnel
+- xray-core folder path
+- Language (EN / RU)
+
+## License
+
+See [LICENSE](LICENSE).
