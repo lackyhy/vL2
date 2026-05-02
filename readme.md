@@ -1,4 +1,4 @@
-# vL2 \ ver: 5.4.0 
+# vL2 \
 
 Console client for xray-core with support for multiple connections and traffic filtering by sites and applications.
 
