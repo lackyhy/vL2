@@ -47,8 +47,15 @@ std::string generateConfig(const Profile& profile, bool tunnelMode, const std::s
     std::string inboundProto = tunnelMode ? "dokodemo-door" : proxyProtocol;
     std::string listenAddr = "127.0.0.1";  // Always listen on localhost for transparent redirect
 
+    // access.log name derived from instance (port distinguishes instances)
+    std::string accessLog = "xray-access-" + std::to_string(port) + ".log";
+
     oss << R"(
 {
+  "log": {
+    "access": ")" << accessLog << R"(",
+    "loglevel": "info"
+  },
   "inbounds": [
     {
       "port": )" << port << R"(,
@@ -2637,3 +2644,75 @@ bool launchAppInNetNS(const std::string& command, Language lang) {
     return false;
 #endif
 }
+
+// ── Windows system proxy ──────────────────────────────────────────────────
+#ifdef _WIN32
+#include <wininet.h>
+#pragma comment(lib, "wininet.lib")
+
+static bool setWinInetRegKey(HKEY hKey, const char* name, DWORD type, const void* data, DWORD size) {
+    return RegSetValueExA(hKey, name, 0, type, (const BYTE*)data, size) == ERROR_SUCCESS;
+}
+
+bool setWindowsSystemProxy(int httpPort, int socksPort, Language lang) {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+            0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+        std::cout << tr(lang,
+            "Failed to open registry key for proxy settings.",
+            "Не удалось открыть раздел реестра для настроек прокси.") << "\n";
+        return false;
+    }
+
+    // Build proxy server string.
+    // Prefer HTTP proxy (universally understood); fall back to SOCKS.
+    std::string proxyServer;
+    if (httpPort > 0) {
+        proxyServer = "127.0.0.1:" + std::to_string(httpPort);
+    } else if (socksPort > 0) {
+        proxyServer = "socks=127.0.0.1:" + std::to_string(socksPort);
+    } else {
+        RegCloseKey(hKey);
+        return false;
+    }
+
+    // Exclusions: bypass proxy for local addresses.
+    const std::string overrides = "localhost;127.*;192.168.*;<local>";
+
+    DWORD enable = 1;
+    bool ok = setWinInetRegKey(hKey, "ProxyEnable",   REG_DWORD, &enable, sizeof(DWORD))
+           && setWinInetRegKey(hKey, "ProxyServer",   REG_SZ,    proxyServer.c_str(), (DWORD)proxyServer.size() + 1)
+           && setWinInetRegKey(hKey, "ProxyOverride", REG_SZ,    overrides.c_str(),   (DWORD)overrides.size() + 1);
+    RegCloseKey(hKey);
+
+    // Notify WinInet / system that proxy settings changed.
+    InternetSetOptionA(nullptr, INTERNET_OPTION_SETTINGS_CHANGED, nullptr, 0);
+    InternetSetOptionA(nullptr, INTERNET_OPTION_REFRESH,          nullptr, 0);
+
+    if (ok) {
+        std::cout << tr(lang, "System proxy set: ", "Системный прокси установлен: ") << proxyServer << "\n";
+        std::cout << tr(lang, "Bypassed: ", "Исключения: ") << overrides << "\n";
+    }
+    return ok;
+}
+
+bool clearWindowsSystemProxy(Language lang) {
+    HKEY hKey = nullptr;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+            0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    DWORD disable = 0;
+    RegSetValueExA(hKey, "ProxyEnable", 0, REG_DWORD, (const BYTE*)&disable, sizeof(DWORD));
+    RegCloseKey(hKey);
+
+    InternetSetOptionA(nullptr, INTERNET_OPTION_SETTINGS_CHANGED, nullptr, 0);
+    InternetSetOptionA(nullptr, INTERNET_OPTION_REFRESH,          nullptr, 0);
+
+    std::cout << tr(lang, "System proxy cleared.", "Системный прокси отключён.") << "\n";
+    return true;
+}
+#endif

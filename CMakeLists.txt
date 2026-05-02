@@ -28,7 +28,7 @@ target_compile_options(vl2 PRIVATE
 )
 
 if(WIN32)
-    target_link_libraries(vl2 PRIVATE shell32 user32)
+    target_link_libraries(vl2 PRIVATE shell32 user32 wininet)
 endif()
 
 # ── MinGW: statically link the C++ / GCC runtime into the exe ──────────────

@@ -204,9 +204,13 @@ int main(int argc, char** argv) {
     bool tunModeActive    = false;   // real TUN virtual interface mode
     bool systemVpnActive  = false;
     bool netNsActive      = false;   // VPN network namespace is set up
+#ifdef _WIN32
+    bool winProxyActive   = false;   // Windows system (WinInet) proxy
+#endif
     ProcessId activePid   = 0;
     std::string listenAddress;
     std::string activeLogFile;
+    std::string activeAccessLogFile; // xray access log (per-connection routing events)
     std::string activeTunIface;      // e.g. "utun5", "tun0"
 
     // ── Second proxy instance ─────────────────────────────────────────────────
@@ -399,18 +403,24 @@ int main(int argc, char** argv) {
                       << "  [" << tr(settings.language, "proxy", "прокси") << ": " << listenAddress2 << "]\n";
         }
         std::cout << "\n";
-        std::cout << tr(settings.language, "Arrow keys / number + Enter to select.  Q = quit.  Ctrl+F = minimize.",
-                                           "Стрелки / цифра + Enter для выбора.  Q = выход.  Ctrl+F = свернуть.") << "\n\n";
+        std::cout << tr(settings.language,
+            "Arrow keys / number + Enter to select.  Q = quit.  Ctrl+F = minimize.  L = traffic log.",
+            "Стрелки / цифра + Enter для выбора.  Q = выход.  Ctrl+F = свернуть.  L = лог трафика.") << "\n\n";
 
         std::vector<std::string> menuItems = {
             tr(settings.language, "Launch xray-core (proxy)", "Запустить xray-core (прокси)"),
-            tr(settings.language, "Launch TUN tunnel (virtual interface)", "Запустить TUN туннель (виртуальный интерфейс)"),
+            // tr(settings.language, "Launch TUN tunnel (virtual interface)", "Запустить TUN туннель (виртуальный интерфейс)"),
             tr(settings.language, "Per-app proxy (route specific apps)", "Прокси для приложений (выбрать приложения)"),
             tr(settings.language, "Profiles", "Профили"),
             tr(settings.language, "Settings", "Настройки")
         };
         if (xrayRunning) {
             menuItems.push_back(tr(settings.language, "Show xray-core status", "Показать статус xray-core"));
+#ifdef _WIN32
+            menuItems.push_back(winProxyActive
+                ? tr(settings.language, "Clear system proxy", "Отключить системный прокси")
+                : tr(settings.language, "Set system proxy",   "Установить системный прокси"));
+#endif
             if (tunnelModeActive && !tunModeActive) {
                 std::string vpnStatus = systemVpnActive ?
                     tr(settings.language, "Disable system VPN", "Отключить системный VPN") :
@@ -443,6 +453,9 @@ int main(int argc, char** argv) {
             if (netNsActive)     cleanupAppNetNS();
             if (systemVpnActive) cleanupSystemVPN(settings);
             if (tunModeActive)   cleanupTunVPN(settings);
+#ifdef _WIN32
+            if (winProxyActive)  clearWindowsSystemProxy(settings.language);
+#endif
             if (activePid2 > 0)  stopXrayCore(activePid2);
             if (activePid > 0)   stopXrayCore(activePid);
             std::cout << tr(settings.language, "Exit...", "Выход...") << "\n";
@@ -465,6 +478,7 @@ int main(int argc, char** argv) {
                 if (netNsActive)     cleanupAppNetNS();
                 if (systemVpnActive) cleanupSystemVPN(settings);
                 if (tunModeActive)   cleanupTunVPN(settings);
+                if (winProxyActive)  clearWindowsSystemProxy(settings.language);
                 if (activePid > 0)   stopXrayCore(activePid);
                 std::cout << tr(settings.language, "Exit...", "Выход...") << "\n";
                 return 0;
@@ -475,8 +489,16 @@ int main(int argc, char** argv) {
 #endif
             continue;
         }
-        if (key == 20) { // Ctrl+T
+        if (key == 20) { // Ctrl+T — main xray log
             if (xrayRunning && !activeLogFile.empty() && logsEnabled) {
+                showXrayLog(activeLogFile, settings.language);
+            }
+            continue;
+        }
+        if (key == 'l' || key == 'L') { // L — traffic routing log (access log)
+            if (xrayRunning && !activeAccessLogFile.empty()) {
+                showXrayLog(activeAccessLogFile, settings.language);
+            } else if (xrayRunning && !activeLogFile.empty()) {
                 showXrayLog(activeLogFile, settings.language);
             }
             continue;
@@ -493,11 +515,15 @@ int main(int argc, char** argv) {
         if (key == '\n' || key == '\r') {
             std::string selectedItem = menuItems[selected];
             std::string launchStr    = tr(settings.language, "Launch xray-core (proxy)", "Запустить xray-core (прокси)");
-            std::string tunLaunchStr = tr(settings.language, "Launch TUN tunnel (virtual interface)", "Запустить TUN туннель (виртуальный интерфейс)");
+            // std::string tunLaunchStr = tr(settings.language, "Launch TUN tunnel (virtual interface)", "...");
             std::string perAppStr    = tr(settings.language, "Per-app proxy (route specific apps)", "Прокси для приложений (выбрать приложения)");
             std::string profilesStr  = tr(settings.language, "Profiles", "Профили");
             std::string settingsStr  = tr(settings.language, "Settings", "Настройки");
             std::string statusStr    = tr(settings.language, "Show xray-core status", "Показать статус xray-core");
+#ifdef _WIN32
+            std::string winProxySetStr   = tr(settings.language, "Set system proxy",   "Установить системный прокси");
+            std::string winProxyClearStr = tr(settings.language, "Clear system proxy", "Отключить системный прокси");
+#endif
             std::string vpnEnableStr = tr(settings.language, "Enable system VPN", "Включить системный VPN");
             std::string vpnDisableStr= tr(settings.language, "Disable system VPN", "Отключить системный VPN");
             std::string stopStr      = tr(settings.language, "Stop xray-core", "Остановить xray-core");
@@ -538,30 +564,11 @@ int main(int argc, char** argv) {
                         std::string proxyProtocol = (pk == '2') ? "http" : "socks";
                         if (launchXrayCore(settings, profiles[idx], false, proxyProtocol,
                                            activeLogFile, listenAddress, activePid)) {
-                            xrayRunning      = true;
-                            tunnelModeActive = false;
-                            tunModeActive    = false;
-                            systemVpnActive  = false;
-                            showXrayLog(activeLogFile, settings.language);
-                        }
-                    }
-                }
-            } else if (selectedItem == tunLaunchStr) {
-                // ── TUN virtual-interface mode ────────────────────────────────
-                if (profiles.empty()) {
-                    clearScreen();
-                    std::cout << tr(settings.language, "No profiles available. Add profiles first.", "Нет доступных профилей. Сначала добавьте профили.") << "\n";
-                    pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
-                } else {
-                    int idx = pickProfile();
-                    if (idx >= 0) {
-                        if (launchXrayTun(settings, profiles[idx],
-                                          activeLogFile, activeTunIface, activePid)) {
-                            xrayRunning      = true;
-                            tunModeActive    = true;
-                            tunnelModeActive = false;
-                            systemVpnActive  = false;
-                            listenAddress    = "127.0.0.1:" + std::to_string(settings.proxyPort);
+                            xrayRunning        = true;
+                            tunnelModeActive   = false;
+                            tunModeActive      = false;
+                            systemVpnActive    = false;
+                            activeAccessLogFile = "xray-access-" + std::to_string(settings.proxyPort) + ".log";
                             showXrayLog(activeLogFile, settings.language);
                         }
                     }
@@ -678,6 +685,19 @@ int main(int argc, char** argv) {
                     std::cout << tr(settings.language, "Listening on: ", "Слушает: ") << listenAddress << "\n";
                 }
                 pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+#ifdef _WIN32
+            } else if (selectedItem == winProxySetStr) {
+                clearScreen();
+                if (setWindowsSystemProxy(settings.httpProxyPort, settings.proxyPort, settings.language)) {
+                    winProxyActive = true;
+                }
+                pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+            } else if (selectedItem == winProxyClearStr) {
+                clearScreen();
+                clearWindowsSystemProxy(settings.language);
+                winProxyActive = false;
+                pauseScreen(tr(settings.language, "\nPress any key to continue...", "\nНажмите любую клавишу для продолжения..."));
+#endif
             } else if (selectedItem == vpnEnableStr) {
                 setupSystemVPN(settings, activePid);
                 systemVpnActive = true;
@@ -746,6 +766,12 @@ int main(int argc, char** argv) {
                     tunModeActive   = false;
                     activeTunIface.clear();
                 }
+#ifdef _WIN32
+                if (winProxyActive) {
+                    clearWindowsSystemProxy(settings.language);
+                    winProxyActive = false;
+                }
+#endif
                 if (stopXrayCore(activePid)) {
                     std::cout << tr(settings.language, "xray-core stopped.", "xray-core остановлен.") << "\n";
                     activePid        = 0;

@@ -37,6 +37,16 @@ bool cleanupSystemVPN(const Settings& settings);
 bool cleanupTunVPN(const Settings& settings);
 bool downloadXrayCore(const Settings& settings);
 
+// ── Windows system proxy ──────────────────────────────────────────────────
+// Sets / clears the Windows system (WinInet) proxy in
+// HKCU\...\Internet Settings. Affects Chrome, Edge, IE and most apps
+// that respect the system proxy.
+// Exclusions added automatically: localhost, 127.*, 192.168.*, <local>
+#ifdef _WIN32
+bool setWindowsSystemProxy(int httpPort, int socksPort, Language lang);
+bool clearWindowsSystemProxy(Language lang);
+#endif
+
 // ── Per-app proxy ──────────────────────────────────────────────────────────
 // Launch a command with SOCKS5/HTTP proxy environment variables injected,
 // and optionally via proxychains-ng if available on the system.
